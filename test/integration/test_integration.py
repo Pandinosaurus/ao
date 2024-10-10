@@ -68,11 +68,12 @@ from torchao.quantization.utils import (
 )
 from torchao.quantization.autoquant import (
     AQInt8DynamicallyQuantizedLinearWeight,
-    AQWeightOnlyQuantizedLinearWeight,
-    AQWeightOnlyQuantizedLinearWeight2,
-    AQWeightOnlyQuantizedLinearWeight3,
+    AQInt8WeightOnlyQuantizedLinearWeight,
+    AQInt8WeightOnlyQuantizedLinearWeight2,
+    AQInt8WeightOnlyQuantizedLinearWeight3,
     AutoQuantizableLinearWeight,
-
+    AQFloat8WeightOnlyQuantizedLinearWeight,
+    AQFloat8PerRowScalingDynamicallyQuantizedLinearWeight,
 )
 from torch.ao.quantization.quantize_fx import convert_to_reference_fx, prepare_fx
 import os
@@ -98,6 +99,7 @@ COMMON_DEVICES = ["cpu", "cuda"]
 COMMON_DTYPES = [torch.float32, torch.float16, torch.bfloat16]
 
 COMMON_DEVICE_DTYPE = list(itertools.product(COMMON_DEVICES, COMMON_DTYPES)).copy()
+is_H100 = torch.cuda.is_available() and torch.cuda.get_device_capability() >= (8, 9)
 
 def _int8wo_api(mod):
     if TORCH_VERSION_AT_LEAST_2_4:
@@ -676,27 +678,28 @@ class TestSubclass(unittest.TestCase):
     ):
         if not "cuda" in test_device:
             self.skipTest("test requires cuda")
-        m, k, n = test_shape
-        x = torch.randn(m, k, device=test_device, dtype=test_dtype)
-        lin = torch.nn.Linear(k, n, device=test_device).to(test_dtype)
-        ref_f = lin(x)
+        with torch.no_grad():
+            m, k, n = test_shape
+            x = torch.randn(m, k, device=test_device, dtype=test_dtype)
+            lin = torch.nn.Linear(k, n, device=test_device).to(test_dtype)
+            ref_f = lin(x)
 
-        lin.weight = torch.nn.Parameter(
-            test_subclass_from_float(lin.weight), requires_grad=False
-        )
-        test = lin(x)
-        self.assertGreater(
-            SQNR(ref_f, test),
-            min_sqnr,
-            f"{lin.weight.__class__.__name__} failed, no compile, dtype={test_dtype}, (m, k, n)={test_shape}"
-        )
-        lin_comp = torch.compile(lin, mode='max-autotune')
-        test_comp = lin_comp(x)
-        self.assertGreater(
-            SQNR(ref_f, test_comp),
-            min_sqnr,
-            f"{lin.weight.__class__.__name__} failed at compile with dtype={test_dtype}, (m, k, n)={test_shape}"
-        )
+            lin.weight = torch.nn.Parameter(
+                test_subclass_from_float(lin.weight), requires_grad=False
+            )
+            test = lin(x)
+            self.assertGreater(
+                SQNR(ref_f, test),
+                min_sqnr,
+                f"{lin.weight.__class__.__name__} failed, no compile, dtype={test_dtype}, (m, k, n)={test_shape}"
+            )
+            lin_comp = torch.compile(lin, mode='max-autotune')
+            test_comp = lin_comp(x)
+            self.assertGreater(
+                SQNR(ref_f, test_comp),
+                min_sqnr,
+                f"{lin.weight.__class__.__name__} failed at compile with dtype={test_dtype}, (m, k, n)={test_shape}"
+            )
 
     @parameterized.expand(COMMON_DEVICE_DTYPE)
     @unittest.skipIf(TORCH_VERSION_AT_LEAST_2_4, "skip because there is some bug in inductor codegen")
@@ -727,21 +730,39 @@ class TestSubclass(unittest.TestCase):
     )
     def test_aq_int8_weight_only_quant_subclass(self, device, dtype):
         self._test_lin_weight_subclass_impl(
-            AQWeightOnlyQuantizedLinearWeight.from_float, device, 35, test_dtype=dtype
+            AQInt8WeightOnlyQuantizedLinearWeight.from_float, device, 35, test_dtype=dtype
         )
 
     @parameterized.expand(COMMON_DEVICE_DTYPE)
     @unittest.skipIf(not TORCH_VERSION_AT_LEAST_2_5, "autoquant+aqt needs newer pytorch")
     def test_aq_int8_weight_only_quant_2_subclass(self, device, dtype):
         self._test_lin_weight_subclass_impl(
-            AQWeightOnlyQuantizedLinearWeight2.from_float, device, 35, test_dtype=dtype
+            AQInt8WeightOnlyQuantizedLinearWeight2.from_float, device, 35, test_dtype=dtype
         )
 
     @parameterized.expand(COMMON_DEVICE_DTYPE)
     @unittest.skipIf(not TORCH_VERSION_AT_LEAST_2_5, "autoquant+aqt needs newer pytorch")
     def test_aq_int8_weight_only_quant_3_subclass(self, device, dtype):
         self._test_lin_weight_subclass_impl(
-            AQWeightOnlyQuantizedLinearWeight3.from_float, device, 35, test_dtype=dtype
+            AQInt8WeightOnlyQuantizedLinearWeight3.from_float, device, 35, test_dtype=dtype
+        )
+
+    @parameterized.expand(COMMON_DEVICE_DTYPE)
+    @unittest.skipIf(not TORCH_VERSION_AT_LEAST_2_5, "autoquant+aqt needs newer pytorch")
+    @unittest.skipIf(not is_H100, "Need H100 to run")
+    def test_aq_float8_weight_only_quant_subclass(self, device, dtype):
+        self._test_lin_weight_subclass_impl(
+            AQFloat8WeightOnlyQuantizedLinearWeight.from_float, device, 30, test_dtype=dtype
+        )
+
+    @parameterized.expand(COMMON_DEVICE_DTYPE)
+    @unittest.skipIf(not TORCH_VERSION_AT_LEAST_2_5, "autoquant+aqt needs newer pytorch")
+    @unittest.skipIf(not is_H100, "Need H100 to run")
+    def test_aq_float8_dynamic_quant_subclass(self, device, dtype):
+        if dtype != torch.bfloat16:
+            self.skipTest("Fails for {dtype}")
+        self._test_lin_weight_subclass_impl(
+            AQFloat8PerRowScalingDynamicallyQuantizedLinearWeight.from_float, device, 25, test_dtype=dtype
         )
 
     @parameterized.expand(COMMON_DEVICE_DTYPE)
@@ -826,6 +847,7 @@ class TestSubclass(unittest.TestCase):
     @torch._inductor.config.patch({"freezing": True})
     @unittest.skipIf(not TORCH_VERSION_AT_LEAST_2_4, "freeze requires torch 2.4 and after.")
     def test_int8_weight_only_quant_with_freeze(self, device, dtype):
+        torch._dynamo.reset()
         self._test_lin_weight_subclass_api_impl(
             _int8wo_api, device, 40, test_dtype=dtype
         )
@@ -1029,7 +1051,7 @@ class TestSaveLoadMeta(unittest.TestCase):
         self.assertTrue(torch.equal(ref_q, test))
 
     @parameterized.expand(COMMON_DEVICE_DTYPE)
-    @unittest.skipIf(is_fbcode(), "'PlainAQTLayout' object has no attribute 'int_data'")
+    @unittest.skipIf(is_fbcode(), "'PlainAQTTensorImpl' object has no attribute 'int_data'")
     @torch.no_grad()
     def test_save_load_dqtensors(self, device, dtype):
         if device == "cpu":
@@ -1462,11 +1484,13 @@ class TestExport(unittest.TestCase):
 
         # make sure it compiles
         example_inputs = (x,)
-        from torch._export import capture_pre_autograd_graph
         # TODO: export changes numerics right now, this is because of functionalization according to Zhengxu
         # we can re-enable this after non-functional IR is enabled in export
         # model = torch.export.export(model, example_inputs).module()
-        model = capture_pre_autograd_graph(model, example_inputs)
+        if TORCH_VERSION_AT_LEAST_2_5:
+            model = torch.export.export_for_training(model, example_inputs).module()
+        else:
+            model = torch._export.capture_pre_autograd_graph(model, example_inputs)
         after_export = model(x)
         self.assertTrue(torch.equal(after_export, ref))
         if api is _int8da_int8w_api:
@@ -1498,10 +1522,10 @@ class TestUtils(unittest.TestCase):
         size = torchao.utils.get_model_size_in_bytes(model)
 
         from torchao.quantization.autoquant import (
-            AQWeightOnlyQuantizedLinearWeight2,
+            AQInt8WeightOnlyQuantizedLinearWeight2,
         )
         qtensor_class_list = (
-            AQWeightOnlyQuantizedLinearWeight2,
+            AQInt8WeightOnlyQuantizedLinearWeight2,
         )
         mod = torchao.autoquant(torch.compile(model), qtensor_class_list = qtensor_class_list, set_inductor_config=False)
         mod(example_input)

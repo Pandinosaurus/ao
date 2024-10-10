@@ -1,6 +1,7 @@
 import torch
-from typing import Tuple, Any
+from typing import Tuple, Any, Callable
 from functools import reduce
+import functools
 from importlib.metadata import version
 from math import gcd
 import torch.nn.utils.parametrize as parametrize
@@ -25,6 +26,7 @@ __all__ = [
     "TORCH_VERSION_AT_LEAST_2_3",
     "TORCH_VERSION_AT_LEAST_2_4",
     "TORCH_VERSION_AT_LEAST_2_5",
+    "TORCH_VERSION_AT_LEAST_2_6",
 
     # Needs to be deprecated in the future
     "TORCH_VERSION_AFTER_2_2",
@@ -178,7 +180,7 @@ def _register_custom_op(lib):
 
         # after this, `_the_op_that_needs_to_be_preserved` will be preserved as
         # torch.ops.my_namespace.the_op_that_needs_to_be_preserved operator after
-        # torch.export.export / torch._export.capture_pre_autograd_graph
+        # torch.export.export / torch._export.export_for_training
 
     """
     from torch._inductor.decomposition import register_decomposition
@@ -285,29 +287,15 @@ def unwrap_tensor_subclass(model, filter_fn=None):
         unwrap_tensor_subclass(child)
     return model
 
-class TorchAOBaseTensor(torch.Tensor):
-    """A util tensor subclass that provides commonly used functions
-    """
-    def _get_to_kwargs(self, *args, **kwargs):
-        # `torch._C._nn._parse_to` can't handle `layout` argument
-        for arg in args:
-            if isinstance(arg, torch.layout):
-                args.remove(arg)
-        if "layout" in kwargs:
-            kwargs.pop("layout")
-        # ignoring `non_blocking` and `memory_format` args since these are not
-        # very useful for most of the tensor subclasses
-        # if in the future there are use cases that need these, we'd recommend
-        # to override `_get_to_kwargs` and return these args
-        device, dtype, _, _ = torch._C._nn._parse_to(*args, **kwargs)
-        device = self.device if device is None else device
-        dtype = self.dtype if dtype is None else dtype
-        kwargs = {
-            "device": device,
-            "dtype": dtype,
-        }
-        return kwargs
 
+def _is_float8_type(dtype: torch.dtype) -> bool:
+    fp8_types = {
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+        torch.float8_e5m2,
+        torch.float8_e5m2fnuz,
+    }
+    return dtype in fp8_types
 
 
 def parse_version(version_string):
@@ -330,10 +318,208 @@ def is_fbcode():
 def torch_version_at_least(min_version):
     return is_fbcode() or compare_versions(torch.__version__, min_version) >= 0
 
+TORCH_VERSION_AT_LEAST_2_6 = torch_version_at_least("2.6.0")
 TORCH_VERSION_AT_LEAST_2_5 = torch_version_at_least("2.5.0")
 TORCH_VERSION_AT_LEAST_2_4 = torch_version_at_least("2.4.0")
 TORCH_VERSION_AT_LEAST_2_3 = torch_version_at_least("2.3.0")
 TORCH_VERSION_AT_LEAST_2_2 = torch_version_at_least("2.2.0")
+
+
+"""
+Helper function for implementing aten op or torch function dispatch
+and dispatching to these implementations.
+"""
+def _implements(cls, aten_ops_or_torch_fns):
+    """Use this decorator to implement a function for an aten ops in __torch_dispatch__
+    (if user passed in a list of ops)
+    or torch function in __torch_function__ (if user passed in a single object)
+
+    class MyTensor(torch.Tensor):
+        ...
+        implements = classmethod(_implements)
+
+    implements = MyTensor.implements
+
+    @implements(torch.nn.functional.linear):
+    def _(func, types, args, kwargs):
+        ...
+
+    """
+    if not hasattr(cls, "_ATEN_OP_OR_TORCH_FN_TABLE"):
+        cls._ATEN_OP_OR_TORCH_FN_TABLE = {}
+
+    if not isinstance(aten_ops_or_torch_fns, (list, tuple)):
+        aten_ops_or_torch_fns = [aten_ops_or_torch_fns]
+    def decorator(func):
+        for op in aten_ops_or_torch_fns:
+            @functools.wraps(op)
+            def wrapper(f, types, args, kwargs):
+                return func(f, types, args, kwargs)
+
+            cls._ATEN_OP_OR_TORCH_FN_TABLE[op] = wrapper
+        return func
+    return decorator
+
+def _dispatch__torch_function__(cls, func, types, args=(), kwargs=None):
+    """Use this util function for a common `__torch_function__` implementation
+    that dispatches to ops/functions registered with `_implements`
+
+    class MyTensor(torch.Tensor):
+        ...
+        __torch_function__ = classmethod(_dispatch__torch_function__)
+    """
+    kwargs = {} if kwargs is None else kwargs
+    if hasattr(cls, "_ATEN_OP_OR_TORCH_FN_TABLE") and \
+       func in cls._ATEN_OP_OR_TORCH_FN_TABLE:
+        return cls._ATEN_OP_OR_TORCH_FN_TABLE[func](func, types, args, kwargs)
+
+    with torch._C.DisableTorchFunctionSubclass():
+        return func(*args, **kwargs)
+
+def _dispatch__torch_dispatch__(cls, func, types, args, kwargs):
+    """Use this util function for a common `__torch_dispatch__` implementation
+    that dispatches to ops/functions registered with `_implements`
+
+    class MyTensor(torch.Tensor):
+        ...
+        __torch_dispatch__ = classmethod(_dispatch__torch_dispatch__)
+    """
+    if hasattr(cls, "_ATEN_OP_OR_TORCH_FN_TABLE") and \
+       func in cls._ATEN_OP_OR_TORCH_FN_TABLE:
+        return cls._ATEN_OP_OR_TORCH_FN_TABLE[func](func, types, args, kwargs)
+
+    arg_types = tuple(type(arg) for arg in args)
+    kwarg_types = {k: type(arg) for k, arg in kwargs}
+    raise NotImplementedError(f"{cls.__name__} dispatch: attempting to run unimplemented operator/function: {func=}, {types=}, {arg_types=}, {kwarg_types=}")
+
+def _register_layout(cls: Callable, layout_type_class: Callable):
+    """Helper function for layout registrations, this is used to implement
+    register_layout decorator for each tensor subclass, see aqt.py for example usage
+
+    Args:
+        cls: Tensor subclass type
+        layout_type_class: the class type of subclass of `LayoutType`, e.g. `PlainLayoutType`
+
+    Returns:
+        a decorator that registers the tensor impl constructor in the table
+    """
+
+    # cls._LAYOUT_CONSTRUCTOR_TABLE is a map from layout_type_class like TensorCoreTiledLayout
+    # to tensor_impl class constructor like TensorCoreTiledAQTTensorImpl.from_plain that can construct a tensor_impl
+    # from plain data like (quantized, unpacked) `data`, `scale`, `zero_point`
+    if not hasattr(cls, "_LAYOUT_CONSTRUCTOR_TABLE"):
+        cls._LAYOUT_CONSTRUCTOR_TABLE = {}
+
+    def decorator(tensor_impl_class):
+        cls._LAYOUT_CONSTRUCTOR_TABLE[layout_type_class] = tensor_impl_class.from_plain
+        if TORCH_VERSION_AT_LEAST_2_5:
+            # Allow serialization to work for models uses this tensor impl subclass
+            torch.serialization.add_safe_globals([layout_type_class, tensor_impl_class])
+        return tensor_impl_class
+    return decorator
+
+def _get_tensor_impl_constructor(cls: Callable, layout_type_class: Callable) -> Callable:
+    """Get TensorImpl class constructor (TensorImplClass.from_plain) for `cls` based on `layout_type_class`
+    `layout_type_class` means the class type of subclass of `LayoutType`, e.g. `PlainLayoutType`
+
+    Args:
+        cls: Tensor subclass type
+        layout_type_class: the class type of subclass of `LayoutType`, e.g. `PlainLayoutType`
+
+    Returns:
+        tensor impl subclass constructor for the layout_type_class
+    """
+    if not hasattr(cls, "_LAYOUT_CONSTRUCTOR_TABLE"):
+        raise ValueError(f"no registered tensor_impl class constructor for: {cls}")
+    if layout_type_class not in cls._LAYOUT_CONSTRUCTOR_TABLE:
+        raise ValueError(f"layout_name: {layout_type_class} is not supported yet for {cls}")
+
+    return cls._LAYOUT_CONSTRUCTOR_TABLE[layout_type_class]
+
+
+class TorchAOBaseTensor(torch.Tensor):
+    """A util tensor subclass that provides commonly used functions
+       new tensor subclass can inherit it to get all the utility functions
+
+       class MyTensor(TorchAOBaseTensor):
+           pass
+
+    This includes:
+       `_get_to_kwargs` that can get the kwargs for `to`
+            class MyTensor(TorchAOBaseTensor):
+                def to(self, *args, **kwargs):
+                    kwargs = _get_to_kwargs(*args, **kwargs)
+                    ...
+        `implements`:
+            implements = MyTensor.implements
+
+            @implements(torch.nn.functional.linear):
+            def _(func, types, args, kwargs):
+                ...
+
+        `register_layout`:
+            register_layout = MyTensor.register_layout
+
+            @register_layout(PlainLayoutType)
+            class PlainAQTTensorImpl(...):
+                ...
+
+         `get_tensor_impl_constructor`:
+            get_tensor_impl_constructor = MyTensor.get_tensor_impl_constructor
+            # in constructor of MyTensor:
+            tensor_impl_ctr = get_tensor_impl_constructor(type(layout_type))
+            tensor_impl = tensor_impl_ctr(data, scale, zero_point, layout_type)
+
+    """
+    implements = classmethod(_implements)
+    __torch_dispatch__ = classmethod(_dispatch__torch_dispatch__)
+    __torch_function__ = classmethod(_dispatch__torch_function__)
+    register_layout = classmethod(_register_layout)
+    get_tensor_impl_constructor = classmethod(_get_tensor_impl_constructor)
+
+    def _get_to_kwargs(self, *args, **kwargs):
+        # `torch._C._nn._parse_to` can't handle `layout` argument
+        for arg in args:
+            if isinstance(arg, torch.layout):
+                args.remove(arg)
+        if "layout" in kwargs:
+            kwargs.pop("layout")
+        # ignoring `non_blocking` and `memory_format` args since these are not
+        # very useful for most of the tensor subclasses
+        # if in the future there are use cases that need these, we'd recommend
+        # to override `_get_to_kwargs` and return these args
+        device, dtype, _, _ = torch._C._nn._parse_to(*args, **kwargs)
+        device = self.device if device is None else device
+        dtype = self.dtype if dtype is None else dtype
+        kwargs = {
+            "device": device,
+            "dtype": dtype,
+        }
+        return kwargs
+
+def fill_defaults(args, n, defaults_tail):
+    """
+    __torch_dispatch__ doesn't guarantee the number of arguments you are
+    passed (e.g., defaulted arguments are not passed); but usually it is
+    convenient to pad out the arguments list with defaults.  This function
+    helps you do that.
+    Args:
+        args: the list of positional arguments passed to __torch_dispatch__
+        n: the number of arguments you are expecting to get
+        defaults_tail: default values for the arguments, starting from the
+            end of the list
+    Example:
+        >>> fill_defaults([1, 2, 3], 5, [3, 4, 5])
+        [1, 2, 3, 4, 5]
+        >>> fill_defaults([1, 2, 3], 5, [None, None, None])
+        [1, 2, 3, None, None]]
+    """
+    if n - len(defaults_tail) > len(args):
+        raise RuntimeError("not enough defaults to fill arguments")
+    r = list(args)
+    for i in range(len(args), n):
+        r.append(defaults_tail[i - n + len(defaults_tail)])
+    return r
 
 
 ## Deprecated, will be deleted in the future

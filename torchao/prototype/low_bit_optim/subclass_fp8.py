@@ -1,6 +1,7 @@
 import torch
 from torch import Tensor
-from torchao.dtypes.utils import _implements, _dispatch__torch_dispatch__
+from torch.utils._python_dispatch import return_and_correct_aliasing
+from torchao.utils import TorchAOBaseTensor
 
 
 aten = torch.ops.aten
@@ -21,8 +22,8 @@ def quantize_fp8(input: Tensor, block_size: int):
 
 # NOTE: FP8 sign bit is redundant for unsigned optim state.
 # we may investigate how to use it to increase range/precision for unsigned optim state.
-class OptimStateFp8(Tensor):
-    implements = classmethod(_implements)
+# https://arxiv.org/abs/2409.12517 uses FP8 E5M2 for 2nd Adam buffer
+class OptimStateFp8(TorchAOBaseTensor):
     tensor_attrs = ["codes", "scale"]
 
     @staticmethod
@@ -57,11 +58,12 @@ class OptimStateFp8(Tensor):
         float_data = self.codes.float()
         float_data = float_data.view(-1, self.block_size) * self.scale.view(-1, 1)
 
-        dtype = output_dtype or torch.get_default_dtype()
-        return float_data.view(self.codes.shape).to(dtype)
+        if output_dtype is not None:
+            float_data = float_data.to(output_dtype)
+        return float_data.view(self.codes.shape)
 
     @classmethod
-    def zeros(cls, shape, block_size: int = 2048, device=None):
+    def zeros(cls, shape, block_size: int = 256, device=None):
         codes = torch.zeros(shape, dtype=DTYPE, device=device)
         scale = torch.zeros(codes.numel() // block_size, device=device)
         return cls(codes, scale)
@@ -71,8 +73,6 @@ class OptimStateFp8(Tensor):
             f"{self.__class__.__name__}(block_size={self.block_size}, "
             f"shape={tuple(self.shape)}, device={self.device}, requires_grad={self.requires_grad})"
         )
-
-    __torch_dispatch__ = classmethod(_dispatch__torch_dispatch__)
 
 
 @OptimStateFp8.implements(aten.copy_.default)
@@ -94,6 +94,17 @@ def _(func, types, args, kwargs):
         dst.copy_(src.dequantize())
 
     return dst
+
+
+@OptimStateFp8.implements(aten._to_copy.default)
+def _(func, types, args, kwargs):
+    # ignore dtype
+    device = kwargs.get("device", None)
+    out = OptimStateFp8(
+        args[0].codes.to(device=device),
+        args[0].scale.to(device=device),
+    )
+    return return_and_correct_aliasing(func, args, kwargs, out)
 
 
 @OptimStateFp8.implements(aten.lerp.Scalar)

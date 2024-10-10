@@ -3,6 +3,7 @@ import tempfile
 
 import pytest
 import torch
+from packaging.version import Version
 from torch import nn
 from torch.testing._internal.common_utils import (
     TestCase,
@@ -75,18 +76,16 @@ class TestQuantize(TestCase):
 
 
 class TestOptim(TestCase):
-    @pytest.mark.xfail(not TORCH_VERSION_AT_LEAST_2_3, reason="torch.compile() fails for PyTorch < 2.3")
+    @pytest.mark.skipif(not TORCH_VERSION_AT_LEAST_2_3, reason="requires PyTorch >= 2.3")
     @parametrize("optim_name", ["Adam8bit", "AdamW8bit", "Adam4bit", "AdamW4bit", "AdamFp8", "AdamWFp8"])
     @parametrize("dtype", [torch.float32, torch.bfloat16])
     @parametrize("device", _DEVICES)
     def test_optim_smoke(self, optim_name, dtype, device):
-        if optim_name.endswith("Fp8") and device == "cuda" and torch.cuda.get_device_capability() < (8, 9):
-            pytest.skip("FP8 requires compute capability >= 8.9")
-        if optim_name.endswith("4bit") and not TORCH_VERSION_AT_LEAST_2_5:
-            pytest.skip("4-bit Adam requires PyTorch > 2.4")
-
-        # reset cache to avoid hitting cache_size_limit, since the function will re-compile for each test
-        torch._dynamo.reset_code_caches()
+        if optim_name.endswith("Fp8") and device == "cuda":
+            if not TORCH_VERSION_AT_LEAST_2_4:
+                pytest.skip("FP8 CUDA requires PyTorch >= 2.4")
+            if torch.cuda.get_device_capability() < (8, 9):
+                pytest.skip("FP8 CUDA requires compute capability >= 8.9")
 
         model = nn.Sequential(nn.Linear(32, 256), nn.ReLU(), nn.Linear(256, 32))
         model.to(device=device, dtype=dtype)
@@ -98,17 +97,43 @@ class TestOptim(TestCase):
         optim.step()
         optim.zero_grad()
 
-    @pytest.mark.skipif(bnb is None, reason="bitsandbytes is not availablle")
+        # test serialization. also test the case CUDA optim loads CPU state dict
+        with tempfile.NamedTemporaryFile() as f:
+            torch.save(optim.state_dict(), f.name)
+            state_dict = torch.load(f.name, map_location="cpu")
+
+        model2 = copy.deepcopy(model)
+        optim2 = getattr(low_bit_optim, optim_name)(model2.parameters())
+        optim2.load_state_dict(state_dict)
+
+        for _ in range(2):
+            x = torch.randn(4, 32, device=device, dtype=dtype)
+
+            model(x).sum().backward()
+            optim.step()
+            optim.zero_grad()
+
+            model2(x).sum().backward()
+            optim2.step()
+            optim2.zero_grad()
+
+        for p1, p2 in zip(model.parameters(), model2.parameters()):
+            torch.testing.assert_close(p2, p1)
+
+    @pytest.mark.skipif(bnb is None, reason="bitsandbytes is not available")
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="bitsandbytes 8-bit Adam only works for CUDA")
-    @pytest.mark.xfail(not TORCH_VERSION_AT_LEAST_2_3, reason="torch.compile() fails for PyTorch < 2.3")
+    @pytest.mark.skipif(not TORCH_VERSION_AT_LEAST_2_3, reason="requires PyTorch >= 2.3")
     @parametrize("optim_name", ["Adam8bit", "AdamW8bit"])
     def test_optim_8bit_correctness(self, optim_name):
         device = "cuda"
         model1 = nn.Sequential(nn.Linear(32, 1024), nn.ReLU(), nn.Linear(1024, 128)).to(device)
         model2 = copy.deepcopy(model1)
 
+        # https://github.com/bitsandbytes-foundation/bitsandbytes/releases/tag/v0.44.0
+        block_size = 256 if Version(bnb.__version__) >= Version("0.44.0") else 2048
+
         optim1 = getattr(bnb.optim, optim_name)(model1.parameters())
-        optim2 = getattr(low_bit_optim, optim_name)(model2.parameters())
+        optim2 = getattr(low_bit_optim, optim_name)(model2.parameters(), block_size=block_size)
 
         for _ in range(2):
             x = torch.randn(4, 32, device=device)
@@ -126,9 +151,10 @@ class TestOptim(TestCase):
         for p1, p2 in zip(model1.parameters(), model2.parameters()):
             torch.testing.assert_close(p2, p1, rtol=1e-5, atol=1e-5)
 
-    @pytest.mark.skipif(lpmm is None, reason="lpmm is not availablle")
+    # this will not run in CI because we can't install lpmm
+    @pytest.mark.skipif(lpmm is None, reason="lpmm is not available")
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="lpmm 4-bit Adam only works for CUDA")
-    @pytest.mark.xfail(not TORCH_VERSION_AT_LEAST_2_3, reason="torch.compile() fails for PyTorch < 2.3")
+    @pytest.mark.skipif(not TORCH_VERSION_AT_LEAST_2_3, reason="requires PyTorch >= 2.3")
     @parametrize("optim_name", ["Adam4bit", "AdamW4bit"])
     def test_optim_4bit_correctness(self, optim_name):
         device = "cuda"
@@ -202,7 +228,7 @@ class TestOptim(TestCase):
         # save checkpoint. make sure it can be serialized by torch.save()
         with tempfile.NamedTemporaryFile() as file:
             torch.save(optim1.state_dict(), file.name)
-            state_dict = torch.load(file.name)
+            state_dict = torch.load(file.name, map_location="cpu")
 
         # resume training
         model2 = copy.deepcopy(model1)
@@ -230,12 +256,11 @@ class TestFSDP2(FSDPTest):
         return 2
 
     @pytest.mark.skipif(not TORCH_VERSION_AT_LEAST_2_5, reason="OptimState8bit dispatch: attempting to run unimplemented operator/function: aten.as_strided.default")
-    @pytest.mark.skipif(TORCH_VERSION_AT_LEAST_2_5, reason="https://github.com/pytorch/ao/issues/652")
     @skip_if_lt_x_gpu(2)
     def test_fsdp2(self):
-        optim_classes = [low_bit_optim.Adam8bit, low_bit_optim.Adam4bit]
+        optim_classes = [low_bit_optim.AdamW8bit, low_bit_optim.AdamW4bit]
         if torch.cuda.get_device_capability() >= (8, 9):
-            optim_classes.append(low_bit_optim.AdamFp8)
+            optim_classes.append(low_bit_optim.AdamWFp8)
 
         self.run_subtests(
             {"optim_cls": optim_classes},
@@ -249,9 +274,6 @@ class TestFSDP2(FSDPTest):
             Transformer,
             TransformerBlock,
         )
-
-        # seems like cache_size_limit is shared between FSDP processes?
-        torch._dynamo.config.cache_size_limit = 8 * self.world_size
 
         batch_size = 3
         vocab_size = 1024

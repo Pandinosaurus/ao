@@ -1,9 +1,4 @@
 import torch
-from torchao.dtypes.utils import (
-    _implements,
-    _dispatch__torch_function__,
-    _dispatch__torch_dispatch__,
-)
 from typing import Callable
 from torch.utils._python_dispatch import return_and_correct_aliasing
 from torchao.utils import (
@@ -94,13 +89,9 @@ class LinearActivationQuantizedTensor(TorchAOBaseTensor):
             self.input_quant_func,
         )
 
-    implements = classmethod(_implements)
-    __torch_function__ = classmethod(_dispatch__torch_function__)
-    __torch_dispatch__ = classmethod(_dispatch__torch_dispatch__)
-
 implements = LinearActivationQuantizedTensor.implements
 
-@implements(torch.nn.functional.linear)
+@implements([torch.nn.functional.linear, aten.linear.default])
 def _(func, types, args, kwargs):
     input_tensor, weight_tensor, bias = (
         args[0],

@@ -12,11 +12,13 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.utils.benchmark as benchmark
-from torch.profiler import profile, ProfilerActivity, record_function
+
+from torchao.float8.config import ScalingGranularity
 
 from utils import (
     get_name_to_shapes_iter, 
     profiler_output_to_filtered_time_by_kernel_name,
+    get_gpu_kernel_gemm_time_s,
 )
 
 # estimating TOPs for matmuls in fp32, fp16, fp8
@@ -47,24 +49,6 @@ def benchmark_fn_in_sec(f, *args, **kwargs):
     return measurement.mean
 
 
-def get_gpu_kernel_gemm_time(f, *args, **kwargs):
-    # warmup
-    f(*args, **kwargs)
-    n_iter = 5
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-        for idx in range(n_iter):
-            f(*args, **kwargs) 
-    data = profiler_output_to_filtered_time_by_kernel_name(prof, n_iter, num_leaf_tensors=0) 
-    # there is only 1 key, aten::mm or aten::_scaled_mm, with unit nanoseconds
-    assert len(data) == 1
-    if "aten::mm" in data:
-        return data["aten::mm"] / 1e6 / n_iter
-    elif "aten::_scaled_mm" in data:
-        return data["aten::_scaled_mm"] / 1e6 / n_iter
-    else:
-        raise AssertionError("unexpected format of data")
-
-
 def do_benchmarks(
     tops, 
     peak_tops, 
@@ -75,7 +59,7 @@ def do_benchmarks(
 ):
     if use_gpu_kernel_time:
         # just the gemm GPU kernel
-        time_sec = get_gpu_kernel_gemm_time(f, *args, **kwargs)
+        time_sec = get_gpu_kernel_gemm_time_s(f, *args, **kwargs)
     else:
         # e2e time including kernel launch overhead
         time_sec = benchmark_fn_in_sec(f, *args, **kwargs)
@@ -93,6 +77,7 @@ def run(
     K: Optional[int] = None,
     N: Optional[int] = None,
     use_gpu_kernel_time: bool = False,
+    scaling_granularity: str = "tensorwise",
 ):
     device = "cuda"
 
@@ -102,6 +87,7 @@ def run(
     dtype = torch.bfloat16
     name_to_shapes = get_name_to_shapes_iter(shape_gen_name, M, K, N)
     fast_accum_vals = [True, False]
+    scaling_granularity = ScalingGranularity(scaling_granularity)
 
     for idx, (fast_accum, (name, (M, K, N))) in enumerate(itertools.product(fast_accum_vals, name_to_shapes)):
         if n_limit is not None and idx >= n_limit:
@@ -127,10 +113,17 @@ def run(
         d1, d2, d3 = torch.float8_e4m3fn, torch.float8_e4m3fn, dtype
         A = torch.zeros(M, K, device=device, dtype=d1)
         B = torch.zeros(K, N, device=device, dtype=d2).t().contiguous().t()
-        scale_a = torch.tensor([1.0], device=device)
-        scale_b = torch.tensor([1.0], device=device)
+        if scaling_granularity == ScalingGranularity.TENSORWISE:
+            scale_a = torch.tensor([1.0], device=device)
+            scale_b = torch.tensor([1.0], device=device)
+        else:
+            assert scaling_granularity == ScalingGranularity.AXISWISE, "unsupported"
+            scale_a = torch.ones(M, 1, device=device)
+            scale_b = torch.ones(1, N, device=device)
 
         def do_matmul(A, B):
+            nonlocal scale_a
+            nonlocal scale_b
             return torch._scaled_mm(
                 A, B, scale_a, scale_b, out_dtype=d3, use_fast_accum=fast_accum
             )

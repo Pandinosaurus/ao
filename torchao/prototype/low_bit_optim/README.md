@@ -6,7 +6,7 @@ This folder implements:
 - 4-bit optimizers as outlined in https://arxiv.org/abs/2309.01507
 - FP8 optimizers using the native `torch.float8_e4m3fn` dtype (experimental)
 
-The implementation is fully done in Python (with tensor subclass) and relies on `torch.compile()` to generate efficient fused kernel.
+The implementation is fully done in Python (with tensor subclass) and relies on `torch.compile()` to generate efficient fused kernel. Thus, your platform must support `torch.compile()` to use these optimizers. We only test on CPU and CUDA, so there might be bugs or errors on other platforms.
 
 ## Usage
 
@@ -19,36 +19,46 @@ model = ...
 optim = Adam8bit(model.parameters())
 ```
 
-To use 4-bit Adam, replace the above with `Adam4bit`. Similarly for `AdamFp8`. You can also change quantization block size by passing `block_size=value` to the optimizer. By default, block size is 2048 for 8-bit and FP8 optimizers, and 128 for 4-bit optimizers.
+To use 4-bit Adam, replace the above with `Adam4bit`. Similarly for `AdamFp8`. You can also change quantization block size by passing `block_size=value` to the optimizer. By default, block size is 256 for 8-bit and FP8 optimizers, and 128 for 4-bit optimizers.
 
 **Other optimizers**: AdamW is also available as `AdamW8bit`, `AdamW4bit`, and `AdamWFp8`. Other optimizers can be added based on demand.
 
 NOTE:
-- The low-bit optimizers require PyTorch >= 2.3. FP8 optimizers require CUDA compute capability >= 8.9.
+- The low-bit optimizers require PyTorch >= 2.3
+- For FP8 optimizers on CUDA, PyTorch >= 2.4 and CUDA compute capability >= 8.9 are required.
 - For 4-bit optimizers, we don't implement rank-1 normalization for quantizing 2nd moment as originally done in the paper.
-- The first training step is expected to be slow since the optimizer needs to be compiled.
 
 ## Benchmarks
 
-Benchmark script for fine-tuning a [timm](https://github.com/huggingface/pytorch-image-models) model on [resisc45](https://huggingface.co/datasets/timm/resisc45) dataset is available at [benchmarks/benchmark_low_bit_adam.py](../../../benchmarks/benchmark_low_bit_adam.py).
+Fine-tune [timm](https://github.com/huggingface/pytorch-image-models)'s [ViT-H](https://huggingface.co/timm/vit_huge_patch14_224.orig_in21k) (630M params) on [resisc45](https://huggingface.co/datasets/timm/resisc45) dataset. PyTorch 2.4, BF16 AMP, compiled model, 1 epoch, batch size 8, cosine LR scheduler, 4070Ti SUPER, fixed random seed. Benchmark script is available at [benchmarks/benchmark_low_bit_adam.py](../../../benchmarks/benchmark_low_bit_adam.py).
 
-Results for fine-tuning ViT-H (630M params) with BF16 AMP for 1 epoch, batch size 8, cosine LR scheduler, 4070Ti SUPER, fixed random seed:
-
-Adam impl       | max memory (GB) | imgs/s | accuracy
-----------------|-----------------|--------|----------
-PyTorch (fused) | 12.23           | 41.8   | 94.38
-bnb 8-bit       |  8.32           | 43.6   | 94.18
-ao 8-bit        |  8.33           | 42.6   | 94.25
-ao FP8 E4M3     |  9.27           | 44.1   | 94.40
-lpmm 4-bit      |  7.72           | 46.0   | 94.29
-ao 4-bit        |  7.72           | 40.0   | 94.03
-lpmm 4-bit (*)  |  7.74           | 26.6   | 94.25
+AdamW impl      | Peak memory allocated (GB) | imgs/s | accuracy
+----------------|----------------------------|--------|----------
+PyTorch (fused) | 12.23                      | 41.9   | 94.52
+bnb 8-bit       |  8.32                      | 43.6   | 94.54
+ao 8-bit        |  8.33                      | 42.5   | 94.30
+ao FP8 E4M3     |  8.33                      | 43.2   | 94.13
+lpmm 4-bit      |  7.72                      | 46.1   | 94.40
+ao 4-bit        |  7.72                      | 42.4   | 94.13
+lpmm 4-bit (*)  |  7.74                      | 26.7   | 94.10
 
 (*) means rank-1 normalization is used for 2nd optimizer state. Refer to [paper](https://arxiv.org/abs/2309.01507) for more details.
 
+Fine-tune [Llama2-7B](https://huggingface.co/meta-llama/Llama-2-7b) on [Alpaca](https://huggingface.co/datasets/tatsu-lab/alpaca) dataset. PyTorch 2.4, full BF16, 1 epoch, A100, fixed random seed. Benchmark is done with [torchtune 52d1b838](https://github.com/pytorch/torchtune/tree/52d1b838c1c35b5e75fddf8776be400adc36dff5). See [#812](https://github.com/pytorch/ao/pull/812) for more details.
+
+AdamW impl       | Peak memory allocated (GB) | toks/s | `truthfulqa_mc2` acc
+-----------------|----------------------------|--------|----------------------
+Not fine-tuned   | -                          | -      | 38.95
+PyTorch (fused)  | 51.6                       | 3200   | 42.61
+bnb 8-bit        | 39.3                       | 3000   | 42.75
+ao 8-bit         | 39.1                       | 2900   | 41.50
+ao 4-bit         | 33.2                       | 2900   | 42.27
+
+NOTE: lpmm's 4-bit AdamW does not support BF16 weights.
+
 ## Optimizer CPU offload
 
-This folder also implements optimizer CPU offload (i.e. ZeRO-Offload) for single GPU training. For multi-GPU training, you can use FSDP's built-in CPU offload.
+This folder also implements optimizer CPU offload (i.e. ZeRO-Offload) for single GPU training. Only CUDA is supported. For multi-GPU training, you can use FSDP's built-in CPU offload.
 
 ```python
 import torch
@@ -75,6 +85,17 @@ model.load_state_dict(ckpt["model"])
 
 optim = CPUOffloadOptimizer(model.parameters(), torch.optim.AdamW, fused=True)
 optim.load_state_dict(ckpt["optim"])
+```
+
+`CPUOffloadOptimizer` is not compatible with PyTorch's built-in LR scheduler because it only acts as a wrapper around the actual optimizers (and extra logic for moving data around). To adjust the LR, you have to manually update it like follows (in fact you can use the below code for all PyTorch optimizers too):
+
+```python
+lr = ... # compute your desired LR value
+for param_group in optim.param_groups: 
+    if isinstance(param_group["lr"], torch.Tensor): 
+        param_group["lr"].fill_(lr) 
+    else: 
+        param_group["lr"] = lr 
 ```
 
 NOTE:

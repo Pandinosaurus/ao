@@ -4,17 +4,17 @@ import torch
 from torch.ao.pruning import WeightNormSparsifier
 from torch.sparse import to_sparse_semi_structured
 from torchao.quantization.quant_api import (
+    _get_linear_subclass_inserter,
     _is_linear,
     _replace_with_custom_fn_if_matches_filter,
-    _get_linear_subclass_inserter,
     int8_dynamic_activation_int8_semi_sparse_weight,
 )
+
 
 # Sparsity helper functions
 def apply_fake_sparsity(model, **kwargs):
     """
     This function simulates 2:4 sparsity on all linear layers in a model.
-    It uses the torch.ao.pruning flow.
     """
     filter_fn = kwargs.pop("filter_fn", _is_linear)
     # torch.ao.pruning flow
@@ -30,21 +30,26 @@ def apply_fake_sparsity(model, **kwargs):
     sparsifier.step()
     sparsifier.squash_mask()
 
+
 def semi_sparse_weight():
     """
     Convert the weight of linear moduels to semi-structured (2:4) sparsity
     """
     return _get_linear_subclass_inserter(to_sparse_semi_structured)
 
-def sparsify_(model: torch.nn.Module,
-             apply_tensor_subclass: Callable[[torch.Tensor], torch.Tensor],
-             filter_fn: Optional[Callable[[torch.nn.Module, str], bool]]=None) -> torch.nn.Module:
+
+def sparsify_(
+    model: torch.nn.Module,
+    apply_tensor_subclass: Callable[[torch.Tensor], torch.Tensor],
+    filter_fn: Optional[Callable[[torch.nn.Module, str], bool]] = None,
+) -> torch.nn.Module:
     """Convert the weight of linear modules in the model with `apply_tensor_subclass`
     This function is essentially the same as quantize, put for sparsity subclasses.
 
-    Currently, we support two options for sparsity:
+    Currently, we support three options for sparsity:
         - semi-structured (2:4) sparsity with `semi_sparse_weight`
-        - int8 dynamic quantization + 2:4 sparsity with `int8_dynamic_activation_int8_semi_sparse_weight`, which is also available via the quantize API
+        - int8 dynamic quantization + 2:4 sparsity with `layout_type=SemiSparseLayoutType`
+        - int4 weight-only quantization + 2:4 sparsity with `layout_type=SparseMarlinLayoutType`
 
     Args:
         model (torch.nn.Module): input model
@@ -67,11 +72,11 @@ def sparsify_(model: torch.nn.Module,
         m = sparsify_(m, semi_sparse_weight(), filter_fn)
 
         # for int8 dynamic quantization + 2:4 sparsity
-        from torchao.sparsity.prototype import int8_dynamic_activation_int8_semi_sparse_weight
-        m = sparsify_(m, int8_dynamic_activation_int8_semi_sparse_weight(), filter_fn)
+        from torchao.dtypes import SemiSparseLayoutType
+        m = quantize_(m, int8_dynamic_activation_int8_weight(layout_type=SemiSparseLayoutType), filter_fn)
     """
     _replace_with_custom_fn_if_matches_filter(
         model,
-        apply_tensor_subclass, 
+        apply_tensor_subclass,
         _is_linear if filter_fn is None else filter_fn,
     )

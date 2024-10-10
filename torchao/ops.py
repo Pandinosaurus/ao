@@ -4,6 +4,13 @@ from torch import Tensor
 from torchao.utils import TORCH_VERSION_AT_LEAST_2_4
 
 
+lib = torch.library.Library("torchao", "FRAGMENT")
+lib.define("quant_llm_linear(int EXPONENT, int MANTISSA, Tensor _in_feats, Tensor _weights, Tensor _scales, int splitK) -> Tensor")
+lib.define("unpack_tensor_core_tiled_layout(Tensor packed_w, int inner_k_tiles) -> Tensor")
+lib.define("dequantize_tensor_core_tiled_layout(Tensor packed_w, Tensor scales_and_zeros, int group_size, int inner_k_tiles) -> Tensor")
+lib.define("marlin_24_gemm(Tensor x, Tensor weight_marlin, Tensor meta, Tensor s, Tensor workspace, int bits, int size_m, int size_n, int size_k) -> Tensor")
+
+
 def register_custom_op(name):
     def decorator(func):
         if TORCH_VERSION_AT_LEAST_2_4:
@@ -28,7 +35,7 @@ def quant_llm_linear(
         EXPONENT: number of exponent bits
         MANTISSA: number of mantissa bits
         _in_feats: input activations in FP16
-        _weights: packed FPx weights
+        _weights: packed Floatx weights
         _scales: scale
         splitK: split K
 
@@ -39,7 +46,14 @@ def quant_llm_linear(
 
 
 @register_custom_op("torchao::quant_llm_linear")
-def _(EXPONENT, MANTISSA, _in_feats, _weights, _scales, splitK = 1):
+def _(
+    EXPONENT: int,
+    MANTISSA: int,
+    _in_feats: Tensor,
+    _weights: Tensor,
+    _scales: Tensor,
+    splitK: int = 1,
+) -> Tensor:
     torch._check(_in_feats.dim() == 2, lambda: f"input should be a 2d tensor, got {_in_feats.dim()}D")
     torch._check(_in_feats.dtype is torch.float16, lambda: f"weight must be FP16, got {_in_feats.dtype}")
     torch._check(_weights.dim() == 2, lambda: f"weight should be a 2d tensor, got {_weights.dim()}D")
@@ -74,9 +88,9 @@ def unpack_tensor_core_tiled_layout(packed_w: Tensor, inner_k_tiles: int) -> Ten
     return torch.ops.torchao.unpack_tensor_core_tiled_layout.default(
         packed_w=packed_w, inner_k_tiles=inner_k_tiles
     )
-    
 
-@register_custom_op(f"torchao::unpack_tensor_core_tiled_layout")
+
+@register_custom_op("torchao::unpack_tensor_core_tiled_layout")
 def _(packed_w: Tensor, inner_k_tiles: int) -> Tensor:
     torch._check(
         packed_w.dim() == 4,
@@ -111,7 +125,7 @@ def dequantize_tensor_core_tiled_layout(packed_w: Tensor, scales_and_zeros: Tens
     - packed weights were generated with `torch.ops.aten._convert_weight_to_int4pack` with `inner_k_tiles = 2 | 4 | 8`"
     - packed scales_and_zeros were generated with `torchao.quantization.utils.pack_tinygemm_scales_and_zeros`
     - qGroupSize is 32 | 64 | 128 | 256
-    
+
     Args:
         packed_w: torch.tensor: 4D tensor with shape `(N / 8) x (K / (inner_k_tiles * 16)) x 32 x inner_k_tiles / 2`, dtype is torch.int32
         scales_and_zeros: torch.tensor: 3D tensor with shape `numQGroups x N x 2`, dtype is torch.bfloat16 where numQGroups is K / qGroupSize
@@ -125,9 +139,9 @@ def dequantize_tensor_core_tiled_layout(packed_w: Tensor, scales_and_zeros: Tens
     return torch.ops.torchao.dequantize_tensor_core_tiled_layout.default(
         packed_w, scales_and_zeros, group_size, inner_k_tiles
     )
-    
 
-@register_custom_op(f"torchao::dequantize_tensor_core_tiled_layout")
+
+@register_custom_op("torchao::dequantize_tensor_core_tiled_layout")
 def _(packed_w: Tensor, scales_and_zeros: Tensor, group_size: int, inner_k_tiles: int) -> Tensor:
     # packed_w preconditions
     torch._check(
@@ -157,7 +171,7 @@ def _(packed_w: Tensor, scales_and_zeros: Tensor, group_size: int, inner_k_tiles
     torch._check(scales_and_zeros.size(0) == K // group_size, lambda: "scales_and_zeros must have K // qGroupSize at dim 0")
     torch._check(scales_and_zeros.size(1) == N, lambda: "scales_and_zeros must have N at dim 1")
     torch._check(scales_and_zeros.size(2) == 2, lambda: "scales_and_zeros must have 2 at dim 2")
-    
+
     return torch.empty((N, K), dtype=torch.bfloat16, device=packed_w.device)
 
 
@@ -192,7 +206,7 @@ def marlin_24_gemm(
     )
 
 
-@register_custom_op(f"torchao::marlin_24_gemm")
+@register_custom_op("torchao::marlin_24_gemm")
 def _(
     x: Tensor,
     weight_marlin: Tensor,

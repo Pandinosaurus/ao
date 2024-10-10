@@ -56,6 +56,7 @@ import copy
 import tempfile
 import gc
 from torch.testing._internal.common_utils import TestCase
+from torch.testing._internal import common_utils
 
 
 def dynamic_quant(model, example_inputs):
@@ -339,8 +340,8 @@ class TestQuantFlow(TestCase):
 
     @unittest.skip("skipping until we get checkpoints for gpt-fast")
     def test_gptq_quantizer_int4_weight_only(self):
-        from torchao.quantization.GPTQ import Int4WeightOnlyGPTQQuantizer
-        from torchao._models._eval import InputRecorder, TransformerEvalWrapper
+        from torchao.quantization.GPTQ_MT import Int4WeightOnlyGPTQQuantizer
+        from torchao._models._eval import MultiTensorInputRecorder, TransformerEvalWrapper
         precision = torch.bfloat16
         device = "cuda"
         checkpoint_path = Path("../checkpoints/meta-llama/Llama-2-7b-chat-hf/model.pth")
@@ -349,22 +350,23 @@ class TestQuantFlow(TestCase):
         model.load_state_dict(checkpoint, assign=True)
         model = model.to(dtype=precision, device="cpu")
         model.eval()
+
         tokenizer_path = checkpoint_path.parent / "tokenizer.model"
         assert tokenizer_path.is_file(), tokenizer_path
         tokenizer = get_tokenizer(  # pyre-ignore[28]
             tokenizer_path,
             "Llama-2-7b-chat-hf",
         )
+
         blocksize = 128
         percdamp = 0.01
         groupsize = 64
         calibration_tasks = ["wikitext"]
-        calibration_limit = 1
+        calibration_limit = 5
         calibration_seq_length = 100
         input_prep_func = prepare_inputs_for_model
         pad_calibration_inputs = False
-
-        inputs = InputRecorder(
+        inputs = MultiTensorInputRecorder(
             tokenizer,
             calibration_seq_length,
             input_prep_func,
@@ -376,14 +378,15 @@ class TestQuantFlow(TestCase):
             calibration_limit,
         ).get_inputs()
 
+
         quantizer = Int4WeightOnlyGPTQQuantizer(
             blocksize,
             percdamp,
             groupsize,
         )
         model.setup_caches(max_batch_size=1, max_seq_length=calibration_seq_length)
-
         model = quantizer.quantize(model, inputs).cuda()
+
         result = TransformerEvalWrapper(
             model.cuda(),
             tokenizer,
@@ -392,7 +395,7 @@ class TestQuantFlow(TestCase):
             device,
         ).run_eval(
             ["wikitext"],
-            1,
+            None,
         )
         assert result['results']['wikitext']['word_perplexity,none'] < 7.77, (
             f"accuracy regressed from 7.76 to {result['results']['wikitext']['word_perplexity,none']}"
@@ -500,12 +503,13 @@ class TestQuantFlow(TestCase):
 
     # TODO: move to a separate test file
     @unittest.skipIf(not TORCH_VERSION_AT_LEAST_2_4, "Test only enabled for 2.4+")
-    def test_quantized_tensor_subclass_8da4w(self):
+    @common_utils.parametrize("mapping_type", [MappingType.SYMMETRIC, MappingType.SYMMETRIC_NO_CLIPPING_ERR])
+    def test_quantized_tensor_subclass_8da4w(self, mapping_type):
         group_size = 32
         m = ToyLinearModel().eval()
         m_copy = copy.deepcopy(m)
         example_inputs = m.example_inputs()
-        quantize_(m, int8_dynamic_activation_int4_weight(group_size=group_size))
+        quantize_(m, int8_dynamic_activation_int4_weight(group_size=group_size, mapping_type=mapping_type))
 
         assert isinstance(m.linear1.weight, LinearActivationQuantizedTensor)
         assert isinstance(m.linear2.weight, LinearActivationQuantizedTensor)
@@ -516,7 +520,7 @@ class TestQuantFlow(TestCase):
         from torchao.quantization.quant_api import Int8DynActInt4WeightQuantizer
         from torchao.quantization.GPTQ import Int8DynActInt4WeightLinear
 
-        quantizer = Int8DynActInt4WeightQuantizer(groupsize=group_size)
+        quantizer = Int8DynActInt4WeightQuantizer(groupsize=group_size, mapping_type=mapping_type)
         m_copy = quantizer.quantize(m_copy)
         assert isinstance(m_copy.linear1, Int8DynActInt4WeightLinear)
         assert isinstance(m_copy.linear2, Int8DynActInt4WeightLinear)
@@ -703,6 +707,45 @@ class TestQuantFlow(TestCase):
         for param in m.parameters():
             assert param.is_cuda
         self.assertLess(memory_streaming, memory_baseline)
+
+class TestMultiTensorFlow(TestCase):
+
+    @unittest.skipIf(not TORCH_VERSION_AT_LEAST_2_4, "Test only enabled for 2.4+")
+    @unittest.skipIf(not torch.cuda.is_available(), "Need CUDA available")
+    def test_multitensor_add_tensors(self):
+        from torchao.quantization.GPTQ_MT import MultiTensor
+        tensor1 = torch.randn(3, 3)
+        tensor2 = torch.randn(3, 3)
+        mt = MultiTensor(tensor1)
+        mt.add_tensors(tensor2)
+        self.assertEqual(mt.count, 2)
+        self.assertTrue(torch.equal(mt.values[0], tensor1))
+        self.assertTrue(torch.equal(mt.values[1], tensor2))
+
+    @unittest.skipIf(not TORCH_VERSION_AT_LEAST_2_4, "Test only enabled for 2.4+")
+    @unittest.skipIf(not torch.cuda.is_available(), "Need CUDA available")
+    def test_multitensor_pad_unpad(self):
+        from torchao.quantization.GPTQ_MT import MultiTensor
+        tensor1 = torch.randn(3, 3)
+        mt = MultiTensor(tensor1)
+        mt.pad_to_length(3)
+        self.assertEqual(mt.count, 3)
+        mt.unpad()
+        self.assertEqual(mt.count, 1)
+        
+    @unittest.skipIf(not TORCH_VERSION_AT_LEAST_2_4, "Test only enabled for 2.4+") 
+    @unittest.skipIf(not torch.cuda.is_available(), "Need CUDA available")
+    def test_multitensor_inplace_operation(self):
+        from torchao.quantization.GPTQ_MT import MultiTensor
+        tensor1 = torch.ones(3, 3)
+        mt = MultiTensor(tensor1)
+        mt += 1  # In-place addition
+        self.assertTrue(torch.equal(mt.values[0], torch.full((3, 3), 2)))
+
+ 
+
+
+common_utils.instantiate_parametrized_tests(TestQuantFlow)
 
 
 if __name__ == "__main__":

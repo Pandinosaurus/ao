@@ -3,13 +3,14 @@
 
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
-from typing import Dict, List, Optional, Tuple
+import importlib.util
+from typing import Dict, List, Optional
 
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 import torch.nn.utils.parametrize as parametrize
 from torchao.utils import find_multiple
-from .quant_primitives import (
+from torchao.quantization.quant_primitives import (
     MappingType,
     ZeroPointDomain,
     choose_qparams_affine,
@@ -40,12 +41,7 @@ __all__ = [
     "recommended_inductor_config_setter"
 ]
 
-try:
-    import lm_eval  # pyre-ignore[21]  # noqa: F401
-
-    _lm_eval_available = True
-except:
-    _lm_eval_available = False
+_lm_eval_available = importlib.util.find_spec("lm_eval") is not None
 
 # basic SQNR
 def compute_error(x, y):
@@ -357,7 +353,7 @@ def groupwise_affine_quantize_tensor_from_qparams(
     quant_max = 2 ** n_bit - 1
 
     int_data = quantize_affine(w, block_size, scales, zeros, output_dtype, quant_min, quant_max, zero_point_domain = ZeroPointDomain.FLOAT)
-    if TORCH_VERSION_AT_LEAST_2_5:
+    if TORCH_VERSION_AT_LEAST_2_5 and w.shape[-1] > 1:
         int_data_device_type = int_data.device.type
         # Move to cpu, until issue with MPS memory management of temporary tensors is resolved
         if int_data_device_type == 'mps':
@@ -376,7 +372,8 @@ def groupwise_affine_dequantize_tensor_from_qparams(
 ):
     assert groupsize > 1
     assert w_int4x8.dim() == 2
-    if TORCH_VERSION_AT_LEAST_2_5:
+    # need to handle single column case so check for dtype/size from groupwise_affine_quantize_tensor_from_qparams path
+    if TORCH_VERSION_AT_LEAST_2_5 and (w_int4x8.dtype == torch.uint8 or w_int4x8.shape[-1]>1):
         data = w_int4x8.to(torch.int32)
         high_bits = data >> 4
         low_bits = data & 0x0F
@@ -418,7 +415,7 @@ def groupwise_affine_dequantize_tensor(
 
 
 # TODO: separate scale and zero point precision
-def get_group_qparams_symmetric(w, n_bit=4, groupsize=128, precision=torch.float32):
+def get_group_qparams_symmetric(w, n_bit=4, groupsize=128, precision=torch.float32, mapping_type=MappingType.SYMMETRIC):
     # needed for GPTQ with padding
     if groupsize > w.shape[-1]:
         groupsize = w.shape[-1]
@@ -427,7 +424,6 @@ def get_group_qparams_symmetric(w, n_bit=4, groupsize=128, precision=torch.float
     assert w.dim() == 2
     assert n_bit <= 8, f"unsupported n_bit: {n_bit}"
 
-    mapping_type = MappingType.SYMMETRIC
     block_size = (1, groupsize)
     eps = torch.finfo(torch.float32).eps
     ranges = {}
@@ -445,8 +441,9 @@ def group_quantize_tensor_symmetric(
     n_bit=4,
     group_size=128,
     precision=torch.float32,
+    mapping_type=MappingType.SYMMETRIC
 ):
-    scales, zeros = get_group_qparams_symmetric(w, n_bit, group_size, precision)
+    scales, zeros = get_group_qparams_symmetric(w, n_bit, group_size, precision, mapping_type)
     n_bit = 4
     max_int = 2 ** (n_bit - 1) - 1
     min_int = -(2 ** (n_bit - 1))

@@ -17,10 +17,12 @@ import torch.distributed as dist
 import torch.nn as nn
 from torchao.float8.config import CastConfig, Float8LinearConfig, ScalingType
 from torchao.float8.float8_linear_utils import convert_to_float8_training
+from torchao.float8.float8_scaling_utils import hp_tensor_to_float8_dynamic
 from torchao.float8.fsdp_utils import WeightWithDynamicFloat8CastTensor
-from fsdp2_common import check_parity_bf16_mp, check_parity_no_mp
+from torchao.testing.float8.fsdp2_utils import check_parity_bf16_mp, check_parity_no_mp
 from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
-from torch.distributed._tensor import DTensor
+from torch.distributed._tensor import DTensor, init_device_mesh
+from torchao.float8.float8_tensor import GemmInputRole
 from torch.testing._internal.common_cuda import TEST_CUDA
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
 from torch.testing._internal.common_fsdp import (
@@ -293,6 +295,34 @@ class TestFloat8MultiProcess(FSDPTest, TestFloat8Common):
         return round(mem_stats["active_bytes.all.current"] / 1e6)
 
 
+class Test2DParallelMultiThread(FSDPTestMultiThread, TestFloat8Common):
+    @property
+    def world_size(self) -> int:
+        return 4
+
+    def test_amax_allreduce_device_mesh(self):
+        dp_size = 2
+        pp_size = self.world_size // dp_size
+        global_mesh = init_device_mesh("cuda", (pp_size, dp_size), mesh_dim_names=("pp", "dp"))
+        dp_mesh  = global_mesh["dp"]
+        pp_mesh = global_mesh["pp"]
+
+        if self.rank in [0, 1]:
+            # rank 0 and 1 are the 1st stage in the pipeline
+            # rank 2 and 4 are doing nothing but waiting for the 1st stage
+            torch.manual_seed(42 + self.rank)
+            hp_tensor = torch.randn(768, 32, device="cuda")
+            float8_tensor = hp_tensor_to_float8_dynamic(
+                hp_tensor,
+                torch.float8_e4m3fn,
+                Float8LinearConfig(
+                    cast_config_weight=CastConfig(scaling_type=ScalingType.DYNAMIC),
+                ),
+                gemm_input_role=GemmInputRole.WEIGHT,
+                reduce_amax=True,
+                device_mesh=dp_mesh
+            )
+
 class TestFloat8MultiThread(FSDPTestMultiThread, TestFloat8Common):
     @property
     def world_size(self) -> int:
@@ -426,16 +456,25 @@ class TestFloat8MultiThread(FSDPTestMultiThread, TestFloat8Common):
         """
         choices = itertools.product(
             [False, True],
-            [ScalingType.DYNAMIC, ScalingType.DELAYED],
+            [ScalingType.DYNAMIC, ScalingType.DELAYED, ScalingType.STATIC],
         )
         for enable_fsdp_float8_all_gather, scaling_type_weight in choices:
+
+            if scaling_type_weight is ScalingType.STATIC:
+                cast_config_weight = CastConfig(
+                    scaling_type=scaling_type_weight,
+                    static_scale=torch.tensor([1.0], device="cuda"),
+                )
+            else:
+                cast_config_weight = CastConfig(scaling_type=scaling_type_weight)
+
             float8_linear_config1 = Float8LinearConfig(
                 enable_fsdp_float8_all_gather=False,
-                cast_config_weight=CastConfig(scaling_type=scaling_type_weight),
+                cast_config_weight=cast_config_weight,
             )
             float8_linear_config2 = Float8LinearConfig(
                 enable_fsdp_float8_all_gather=enable_fsdp_float8_all_gather,
-                cast_config_weight=CastConfig(scaling_type=scaling_type_weight),
+                cast_config_weight=cast_config_weight,
             )
             module_fp32 = self.init_single_module()
             ref_module = copy.deepcopy(module_fp32)
