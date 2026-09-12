@@ -13,16 +13,13 @@ import math
 from typing import Tuple
 
 import tabulate
-
 import torch
 
 from torchao.prototype.mx_formats.constants import (
-    DTYPE_FP4,
     DTYPE_FP6_E2M3,
     DTYPE_FP6_E3M2,
 )
-
-from torchao.prototype.mx_formats.custom_cast import get_bits
+from torchao.prototype.mx_formats.kernels import get_bits
 
 dtype_to_bitwidth = {
     torch.float: 32,
@@ -289,9 +286,7 @@ float4_e2m1_interesting_values = [
 ]
 float4_e2m1_neg = []
 for fp32_ref, formula, _s, e, m, label in float4_e2m1_interesting_values:
-    float4_e2m1_neg.append(
-        [-1 * fp32_ref, "-" + formula, "1", e, m, label + "_neg"]
-    )  # noqa: E501
+    float4_e2m1_neg.append([-1 * fp32_ref, "-" + formula, "1", e, m, label + "_neg"])  # noqa: E501
 float4_e2m1_interesting_values.extend(float4_e2m1_neg)
 del float4_e2m1_neg
 
@@ -305,9 +300,7 @@ float6_e3m2_interesting_values = [
 ]
 float6_e3m2_neg = []
 for fp32_ref, formula, _s, e, m, label in float6_e3m2_interesting_values:
-    float6_e3m2_neg.append(
-        [-1 * fp32_ref, "-" + formula, "1", e, m, label + "_neg"]
-    )  # noqa: E501
+    float6_e3m2_neg.append([-1 * fp32_ref, "-" + formula, "1", e, m, label + "_neg"])  # noqa: E501
 float6_e3m2_interesting_values.extend(float6_e3m2_neg)
 del float6_e3m2_neg
 
@@ -500,7 +493,7 @@ def run(dtype):
     headers = ["orig_val", "formula", "s_enc", "e_enc", "m_enc", "note"]
     results = []
 
-    if dtype == DTYPE_FP4:
+    if dtype == torch.float4_e2m1fn_x2:
         results = float4_e2m1_interesting_values
     elif dtype == DTYPE_FP6_E3M2:
         results = float6_e3m2_interesting_values
@@ -545,6 +538,6 @@ if __name__ == "__main__":
         torch.float8_e5m2,
         DTYPE_FP6_E3M2,
         DTYPE_FP6_E2M3,
-        DTYPE_FP4,
+        torch.float4_e2m1fn_x2,
     ):
         run(dtype)

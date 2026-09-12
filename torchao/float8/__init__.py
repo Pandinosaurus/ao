@@ -1,46 +1,54 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD 3-Clause license found in the
-# LICENSE file in the root directory of this source tree.
 # Lets define a few top level things here
+# Needed to load Float8TrainingTensor with weights_only = True
+from torch.serialization import add_safe_globals
+
 from torchao.float8.config import (
     CastConfig,
-    DelayedScalingConfig,
     Float8GemmConfig,
     Float8LinearConfig,
+    Float8LinearRecipeName,
+    ScalingGranularity,
     ScalingType,
 )
-from torchao.float8.float8_linear import Float8Linear
 from torchao.float8.float8_linear_utils import (
+    _auto_filter_for_recipe,
     convert_to_float8_training,
-    linear_requires_sync,
-    sync_float8_amax_and_scale_history,
 )
-from torchao.float8.float8_tensor import (
-    Float8Tensor,
+from torchao.float8.float8_training_tensor import (
+    Float8TrainingTensor,
     GemmInputRole,
     LinearMMConfig,
     ScaledMMConfig,
 )
 from torchao.float8.fsdp_utils import precompute_float8_dynamic_scale_for_fsdp
+from torchao.float8.inference import Float8MMConfig
+from torchao.float8.types import FP8Granularity
 
-# Needed to load Float8Tensor with weights_only = True
-from torch.serialization import add_safe_globals
-
-add_safe_globals([Float8Tensor, ScaledMMConfig, GemmInputRole, LinearMMConfig])
+add_safe_globals(
+    [
+        Float8TrainingTensor,
+        ScaledMMConfig,
+        GemmInputRole,
+        LinearMMConfig,
+        Float8MMConfig,
+        ScalingGranularity,
+    ]
+)
 
 __all__ = [
     # configuration
-    "DelayedScalingConfig",
     "ScalingType",
+    "ScalingGranularity",
     "Float8GemmConfig",
     "Float8LinearConfig",
+    "Float8LinearRecipeName",
     "CastConfig",
+    "ScalingGranularity",
     # top level UX
     "convert_to_float8_training",
-    "linear_requires_sync",
-    "sync_float8_amax_and_scale_history",
     "precompute_float8_dynamic_scale_for_fsdp",
-    # note: Float8Tensor and Float8Linear are not public APIs
+    "_auto_filter_for_recipe",
+    # types
+    "FP8Granularity",
+    # note: Float8TrainingTensor and Float8Linear are not public APIs
 ]

@@ -3,13 +3,11 @@
 import json
 import os
 import warnings
-
 from dataclasses import dataclass
-from typing import Any, Callable, cast, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
 from urllib.error import HTTPError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
-
 
 GITHUB_API_URL = "https://api.github.com"
 
@@ -52,10 +50,10 @@ def gh_fetch_url_and_headers(
         ):
             print(
                 f"""Rate limit exceeded:
-                Used: {err.headers['X-RateLimit-Used']}
-                Limit: {err.headers['X-RateLimit-Limit']}
-                Remaining: {err.headers['X-RateLimit-Remaining']}
-                Resets at: {err.headers['x-RateLimit-Reset']}"""
+                Used: {err.headers["X-RateLimit-Used"]}
+                Limit: {err.headers["X-RateLimit-Limit"]}
+                Remaining: {err.headers["X-RateLimit-Remaining"]}
+                Resets at: {err.headers["x-RateLimit-Reset"]}"""
             )
         raise
 

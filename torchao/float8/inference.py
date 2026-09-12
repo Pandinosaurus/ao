@@ -7,238 +7,306 @@
 Defines an nn module designed to be used during inference
 """
 
-from dataclasses import dataclass
-
-from enum import auto, Enum
-from typing import Callable, List, Optional
+import math
+from typing import List, NamedTuple, Optional, Tuple, Union
 
 import torch
-import torch.nn as nn
-from torchao.float8.float8_linear_utils import swap_linear_layers
 
-from torchao.float8.float8_tensor import (
-    Float8Tensor,
-    GemmInputRole,
-    hp_tensor_and_scale_to_float8,
-    LinearMMConfig,
-    ScaledMMConfig,
-    tensor_already_casted_to_fp8,
+from torchao.float8.float8_utils import is_row_major, pad_tensor_for_matmul
+from torchao.float8.types import FP8Granularity
+from torchao.utils import (
+    is_MI300,
+    is_MI350,
+    is_sm_at_least_89,
 )
-from torchao.float8.float8_utils import e4m3_dtype, tensor_to_scale
+
+Tensor = torch.Tensor
 
 
-class ActivationCasting(Enum):
-    """Types of quantization to perform on the activations
+class Float8MMConfig(NamedTuple):
+    """
+    Configuration for the scaled_mm in the forward and backward pass.
 
-    WEIGHT_ONLY: Only quantize the weight, no activation casting, weight will be dequantized in the forward pass
-    STATIC: Activation is quantized during model initialization with a static scale
-    DYNAMIC: Activation is quantized during forward pass with a dynamic scale calculated from the input activation
+    Attributes:
+        emulate (bool): Whether to emulate the matmuls in fp32.
+        use_fast_accum (bool): Whether to use the fast-accumulation option for scaled_mm.
+        pad_inner_dim (bool): Whether to pad the inner dimension of a and b with 0s.
+                              This is needed for matmuls not aligned to 16.
     """
 
-    # TODO: A better name would be NONE, we should unify this with torchao
-    WEIGHT_ONLY = auto()
-    DYNAMIC = auto()
-    STATIC = auto()
+    emulate: bool = False
+    use_fast_accum: bool = False
+    pad_inner_dim: bool = False
 
 
-@dataclass(frozen=True)
-class QuantConfig:
-    """Defines the configuration for the quantization to fp8 of a linear module
-
+def preprocess_data(
+    a_data: Tensor,
+    b_data: Tensor,
+    scaled_mm_config: Float8MMConfig,
+) -> Tuple[Tensor, Tensor]:
+    """Preprocess the inner fp8 data tensors for admmm
     Args:
-        activation_casting: The type of quantization to perform on the activations
-        static_quantization_scale: The scale of the input to this linear module, used for static quantization only
-    """
-
-    activation_casting: ActivationCasting
-    static_quantization_scale: Optional[torch.Tensor] = None
-
-    # If True, then prior to performing the fp8 scaled mamtmul we will pad the
-    # inner dimension of a (dim 1) and b (dim 2) with 0s. This is needed for matmuls
-    # _scaled_mm since it has the strong constraint that for M,N,K  N, K must be a multiple of 16.
-    # This can cause a memory spike however so we keep this off by default.
-    pad_inner_dim = False
-
-    def __post_init__(self):
-        if self.activation_casting == ActivationCasting.STATIC:
-            assert isinstance(
-                self.static_quantization_scale, torch.Tensor
-            ), "When activation_casting is 'static', activation_scale must be a tensor."
-
-
-class Float8InferenceLinear(torch.nn.Linear):
-    """
-    This is a wrapper around torch.nn.Linear that supports FP8 inference
-    Supported forms of inference:
-        - FP8 inference with high precision matmul - weight only
-        - FP8 inference with fp8 matmul and dynamic weight casting
-        - FP8 inference with fp8 matmul and static weight casting
-    """
-
-    def __init__(
-        self,
-        # FP8 specific arguments
-        quant_config: QuantConfig,
-        linear_mm_config: LinearMMConfig,
-        # nn.Linear arguments
-        in_features: int,
-        out_features: int,
-        bias: bool = True,
-        device: Optional[torch.device] = None,
-        dtype: Optional[torch.dtype] = None,
-    ) -> None:
-        # Construct the superclass this will create dummy weights and biases
-        super().__init__(in_features, out_features, bias, device, dtype)
-        self.linear_mm_config = linear_mm_config
-        self.activation_casting = quant_config.activation_casting
-        if self.activation_casting == ActivationCasting.STATIC:
-            self.register_buffer(
-                "static_quantization_scale", quant_config.static_quantization_scale
-            )
-        else:
-            self.static_quantization_scale = None
-
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        if self.activation_casting == ActivationCasting.WEIGHT_ONLY:
-            return torch.nn.functional.linear(
-                input, self.weight.to_original_precision()
-            )
-
-        x_fp8 = cast_to_float8_e4m3_inference(
-            input,
-            self.linear_mm_config,
-            static_quantization_scale=self.static_quantization_scale,
-        )
-        return torch.nn.functional.linear(x_fp8, self.weight, self.bias)
-
-    # Builder functions for Float8LinearInference
-    def quantize_weight(self, dtype: torch.dtype = e4m3_dtype) -> None:
-        """This functions converts the weight to a Float8Tensor and sets its requires_grad to False.
-
-        Args:
-            dtype: The dtype to quantize the weight to. Default is e4m3_dtype.
-
-        Note:
-            This function is typically called during inference to quantize the weight once since
-            the weight is not updated during inference.
-
-        """
-        assert not isinstance(
-            self.weight, Float8Tensor
-        ), "Weight has already been quantized, cannot quantize again."
-        scale = tensor_to_scale(self.weight, dtype)
-        quantized_weight = hp_tensor_and_scale_to_float8(
-            self.weight,
-            scale,
-            dtype,
-            self.linear_mm_config,
-            GemmInputRole.WEIGHT,
-        )
-        self.weight = nn.Parameter(quantized_weight)
-        self.weight.requires_grad = False
-
-    def set_weight_and_bias(
-        self, weight: torch.nn.Parameter, bias: Optional[torch.nn.Parameter]
-    ):
-        self.weight = weight
-        self.bias = bias
-
-    @classmethod
-    def from_float(
-        cls, module: nn.Module, quant_config: QuantConfig, use_fast_accum: bool
-    ) -> "Float8InferenceLinear":
-        """
-        Create an nn.Linear with fp8 compute from another nn.Linear
-
-        Args:
-            module (torch.nn.Linear): nn.Linear to convert
-            quant_config (QuantConfig): Configuration for the weight and activation casting
-        """
-        forward_config = ScaledMMConfig(
-            False, use_fast_accum, pad_inner_dim=quant_config.pad_inner_dim
-        )
-        linear_mm_config = LinearMMConfig(
-            forward_config, forward_config, forward_config
-        )
-        linear = cls(
-            quant_config,
-            linear_mm_config,
-            module.in_features,
-            module.out_features,
-            False,
-            device=torch.device("meta"),
-        )
-        linear.set_weight_and_bias(module.weight, module.bias)
-        linear.quantize_weight()
-        return linear
-
-
-def cast_to_float8_e4m3_inference(
-    input_tensor: torch.Tensor,
-    linear_mm_config: LinearMMConfig,
-    reduce_amax: bool = False,
-    static_quantization_scale: Optional[torch.Tensor] = None,
-) -> Float8Tensor:
-    """Casts an input tensor to the Float8 (e4m3fn*)
-
-    Args:
-        input_tensor: The input tensor to be cast.
-        linear_mm_config: Configuration settings for the matrix multiplication
-        reduce_amax: Whether to reduce the amax (absolute maximum) among the local distributed group.
-        static_quantization_scale: Optional tensor specifying the scale for activation. Default is None.
-
+        a_data: Input tensor A.
+        b_data: Input tensor B.
+        scaled_mm_config: Configuration for _scaled_mm.
     Returns:
-        Float8Tensor: The input tensor cast to Float8 (e4m3fn) format.
-
-    Note:
-        If the input tensor is already in Float8 format, it is returned as is without re-casting.
+        Preprocessed tensors A and B in the format for _scaled_mm.
     """
-    if tensor_already_casted_to_fp8(input_tensor):
-        return input_tensor
-    scale = (
-        static_quantization_scale
-        if static_quantization_scale is not None
-        else tensor_to_scale(input_tensor, e4m3_dtype, reduce_amax)
-    )
-    return hp_tensor_and_scale_to_float8(
-        input_tensor,
-        scale,
-        e4m3_dtype,
-        linear_mm_config,
-        GemmInputRole.INPUT,
+    if scaled_mm_config.pad_inner_dim:
+        assert a_data.size(1) == b_data.size(0), (
+            f"Inner dims must match for mm, got {a_data.size(1)} and {b_data.size(0)}"
+        )
+        a_data = pad_tensor_for_matmul(a_data, dims=1)
+        b_data = pad_tensor_for_matmul(b_data, dims=0)
+    if not is_row_major(a_data.stride()):
+        a_data = a_data.contiguous()
+    if is_row_major(b_data.stride()):
+        b_data = b_data.t().contiguous().t()
+    return a_data, b_data
+
+
+def preprocess_scale(input_scale: torch.Tensor, input_shape: Tuple[int, ...]):
+    """Ensures input tensor is correctly formatted for _scaled_mm"""
+
+    # For PerTensor quantization, scale should be a scalar or have shape [1]
+    if input_scale.numel() == 1:
+        # Already a scalar, ensure it has the right shape for _scaled_mm
+        return input_scale.reshape(1, 1)
+
+    # For per-row/block quantization, we need to handle the reshaping
+    input_scale = input_scale.unsqueeze(-1)
+
+    # Match: #input_data.reshape(-1, input_data.shape[-1])
+    if input_scale.dim() > 2:
+        input_scale = input_scale.reshape(-1, input_scale.shape[-1])
+
+    return input_scale
+
+
+def addmm_float8_unwrapped_inference(
+    a_data: Tensor,
+    a_scale: Tensor,
+    b_data: Tensor,
+    b_scale: Tensor,
+    output_dtype: torch.dtype,
+    output_scale: Optional[Tensor] = None,
+    bias: Optional[Tensor] = None,
+    use_fast_accum: bool = False,
+) -> Tensor:
+    """
+    This is the unwrapped version of addmm_float8, which does not take in Float8TrainingTensors
+    as inputs. This is used to standardize the logic between subclassed and non subclassed
+    versions of the linear module.
+    """
+
+    if output_dtype == torch.float32 and bias is not None:
+        # Bias is not supported by _scaled_mm when output is fp32
+        output = torch._scaled_mm(
+            a_data,
+            b_data,
+            scale_a=a_scale,
+            scale_b=b_scale,
+            scale_result=output_scale,
+            out_dtype=output_dtype,
+            use_fast_accum=use_fast_accum,
+        )
+        return output + bias
+    return torch._scaled_mm(
+        a_data,
+        b_data,
+        scale_a=a_scale,
+        scale_b=b_scale,
+        bias=bias,
+        scale_result=output_scale,
+        out_dtype=output_dtype,
+        use_fast_accum=use_fast_accum,
     )
 
 
-def quantize_to_float8(
-    module: nn.Module,
-    quant_config: QuantConfig,
-    *,
-    module_filter_fn: Optional[Callable[[nn.Module, str], bool]] = None,
-    use_fast_accum: bool = True,
-) -> nn.Module:
+def _slice_scale_for_dimension(
+    scale: torch.Tensor,
+    data_shape: List[int],
+    dim: int,
+    start: int,
+    end: int,
+    step: int,
+) -> torch.Tensor:
     """
-    Converts torch.nn.Linear layers in the given module to Float8InferenceLinear.
+    Slice the scale tensor appropriately based on the data tensor slicing.
+    This function calculates how the scale should be sliced when the data tensor
+    is sliced along a given dimension, taking into account the block structure.
+    """
+    aten = torch.ops.aten
 
-    Note:
-        If applied to a root-level nn.Linear, the module will not be modified in place
-        and returned instead
+    # Unsupported case for now, this would be 1 scale per data element
+    if scale.shape == data_shape:
+        return aten.slice.Tensor(scale, dim, start, end, step)
+
+    # Reconstruct block sizes based on data shape and scale shape
+    block_sizes = tuple(data_shape[i] // scale.shape[i] for i in range(len(data_shape)))
+
+    if dim >= len(block_sizes):
+        # Slicing beyond the dimensions we care about
+        return scale
+
+    block_size_for_dim = block_sizes[dim]
+
+    if block_size_for_dim == 1:
+        # Scale is per-element along this dimension
+        # Slice away as normal
+        return aten.slice.Tensor(scale, dim, start, end, step)
+    else:
+        # There is blocking in this dimension
+        # Calculate which scale elements correspond to the sliced data
+        scale_start = start // block_size_for_dim if start is not None else None
+        scale_end = (
+            (end + block_size_for_dim - 1) // block_size_for_dim
+            if end is not None
+            else None
+        )
+
+        # Error on Step > 1
+        if step > 1:
+            raise NotImplementedError(
+                "Slicing with step > 1 is not implemented for scale tensors."
+            )
+
+        return aten.slice.Tensor(scale, dim, scale_start, scale_end, 1)
+
+
+def _is_rowwise_scaled(x: torch.Tensor) -> bool:
+    """Checks if a quantized tensor is rowwise scaled
+    Args:
+        x: quantized tensor (should have `block_size` attribute)
+    """
+    assert hasattr(x, "block_size"), "Expecting input to have `block_size` attribute"
+    return tuple(x.block_size) == (1,) * (x.dim() - 1) + (x.shape[-1],)
+
+
+def _is_tensorwise_scaled(x: torch.Tensor) -> bool:
+    """Checks if a quantized tensor is rowwise scaled
+    Args:
+        x: quantized tensor (should have `block_size` attribute)
+    """
+    assert hasattr(x, "block_size"), "Expecting input to have `block_size` attribute"
+    return all(
+        x.block_size[i] == -1 or x.block_size[i] == x.shape[i] for i in range(x.ndim)
+    )
+
+
+def _is_1_128_scaled(x: torch.Tensor) -> bool:
+    """Checks if a quantized tensor is scaled with a block size of 1x128
+    Args:
+        x: quantized tensor (should have `block_size` attribute)
+    """
+    assert hasattr(x, "block_size"), "Expecting input to have `block_size` attribute"
+    b = x.block_size
+    return len(b) >= 2 and math.prod(b[:-1]) == 1 and b[-1] == 128
+
+
+def _is_128_128_scaled(x: torch.Tensor) -> bool:
+    """Checks if a quantized tensor is scaled with a block size of 128x128
+    Args:
+        x: quantized tensor (should have `block_size` attribute)
+    """
+    assert hasattr(x, "block_size"), "Expecting input to have `block_size` attribute"
+    b = x.block_size
+    return len(b) == 2 and b[0] == 128 and b[1] == 128
+
+
+def _granularity_is_a_1_128_w_128_128(
+    g: Union[
+        FP8Granularity,
+        Tuple[FP8Granularity, FP8Granularity],
+        list[FP8Granularity],
+    ],
+) -> bool:
+    from torchao.quantization.granularity import (
+        PerBlock,
+    )
+
+    return len(g) == 2 and g[0] == PerBlock([1, 128]) and g[1] == PerBlock([128, 128])
+
+
+def _normalize_granularity(
+    granularity: Optional[
+        Union[
+            FP8Granularity,
+            Tuple[FP8Granularity, FP8Granularity],
+            list[FP8Granularity],
+        ]
+    ],
+) -> Tuple[FP8Granularity, FP8Granularity]:
+    from torchao.quantization.granularity import (
+        PerRow,
+        PerTensor,
+    )
+
+    processed_granularity = None
+    if granularity is None:
+        processed_granularity = (PerTensor(), PerTensor())
+    elif isinstance(granularity, (PerTensor, PerRow)):
+        processed_granularity = (granularity, granularity)
+    elif isinstance(granularity, (tuple, list)) and len(granularity) == 2:
+        is_per_tensor = isinstance(granularity[0], PerTensor) and isinstance(
+            granularity[1], PerTensor
+        )
+        is_per_row = isinstance(granularity[0], PerRow) and isinstance(
+            granularity[1], PerRow
+        )
+        is_a_1_128_w_128_128 = _granularity_is_a_1_128_w_128_128(granularity)
+
+        if not (is_per_tensor or is_per_row or is_a_1_128_w_128_128):
+            raise ValueError(f"Unsupported granularity types: {granularity}.")
+        if not isinstance(granularity[0], type(granularity[1])):
+            raise ValueError(
+                f"Different granularities for activation and weight are not supported: {granularity}."
+            )
+        processed_granularity = tuple(granularity)
+    else:
+        raise ValueError(f"Invalid granularity specification: {granularity}.")
+    return processed_granularity
+
+
+def _check_hardware_support(
+    granularities: Tuple[FP8Granularity, FP8Granularity],
+) -> None:
+    """
+    Validate that the hardware supports the requested granularities.
 
     Args:
-        module (nn.Module): The module to modify.
-        quant_config (QuantConfig): Quantization configuration for Float8 conversion.
-        module_filter_fn: If specified, only the `torch.nn.Linear` subclasses that
-            that pass the filter function will be swapped. The inputs to the
-            filter function are the module instance and the FQN.
-        use_fast_accum : Whether to enable fast accumulation for the Float8InferenceLinear. Defaults to True.
-
-    Returns:
-        nn.Module: The modified module with applicable Linear layers converted to Float8.
+        granularities: Tuple of (activation_granularity, weight_granularity)
 
     Raises:
-        AssertionError: If a root-level nn.Linear with children is encountered.
+        AssertionError: If hardware doesn't support the requested granularity
+        ValueError: If invalid granularity type is provided
     """
-    return swap_linear_layers(
-        module,
-        lambda m: Float8InferenceLinear.from_float(m, quant_config, use_fast_accum),
-        module_filter_fn=module_filter_fn,
+    from torchao.quantization.granularity import (
+        PerRow,
+        PerTensor,
     )
+
+    is_per_tensor = isinstance(granularities[0], PerTensor) and isinstance(
+        granularities[1], PerTensor
+    )
+    is_per_row = isinstance(granularities[0], PerRow) and isinstance(
+        granularities[1], PerRow
+    )
+    is_a_1_128_w_128_128 = _granularity_is_a_1_128_w_128_128(granularities)
+
+    if is_per_tensor or is_per_row:
+        assert torch.xpu.is_available() or (
+            torch.cuda.is_available()
+            and is_sm_at_least_89()
+            or is_MI300()
+            or is_MI350()
+        ), (
+            "Float8 dynamic quantization requires CUDA compute capability ≥8.9 or MI300+ or XPU."
+        )
+    elif is_a_1_128_w_128_128:
+        # TODO(future PR): look into AMD support
+        assert torch.xpu.is_available() or is_sm_at_least_89(), (
+            "Float8 1x128 activation and 128x128 weight scaling requires CUDA compute capability ≥8.9 or XPU."
+        )
+    else:
+        raise ValueError(f"Invalid granularities {granularities}.")

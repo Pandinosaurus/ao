@@ -11,18 +11,19 @@ from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
 import pandas as pd
-
 import torch
 import torch.utils.benchmark as benchmark
-from torchao.float8.config import CastConfig, Float8LinearConfig, ScalingType
-from torchao.float8.float8_linear import Float8Linear
-from torchao.float8.float8_linear_utils import (
-    linear_requires_sync,
-    sync_float8_amax_and_scale_history,
-)
-from torchao.float8.float8_tensor import ScaledMMConfig
-from utils import get_name_to_shapes_iter
 from tqdm import tqdm
+from utils import get_name_to_shapes_iter
+
+from torchao.float8.config import (
+    CastConfig,
+    Float8LinearConfig,
+    ScalingGranularity,
+    ScalingType,
+)
+from torchao.float8.float8_linear import Float8Linear
+from torchao.float8.float8_training_tensor import ScaledMMConfig
 
 # estimating TOPs for matmuls in fp32, fp16, fp8
 # assuming A * B = C, with A being M * K, B being K * N, C being M * N
@@ -91,6 +92,8 @@ class Experiment:
         return self.float8_tops_sec / dtype_to_peak_tops[torch.float8_e4m3fn]
 
 
+# TODO(future PR): add option to measure GPU kernel time, as in other
+# scripts in this folder
 def main(
     sweep_path: Optional[Path] = None,
     compile: bool = True,
@@ -98,13 +101,14 @@ def main(
     fast_accum_filter: Optional[bool] = None,
     shape_name_filter: Optional[str] = None,
     *,
-    shape_gen_name: str = 'llama',
+    shape_gen_name: str = "llama",
     M: Optional[int] = None,
     K: Optional[int] = None,
     N: Optional[int] = None,
     scaling_type_input: str = "dynamic",
     scaling_type_weight: str = "dynamic",
     scaling_type_grad_output: str = "dynamic",
+    scaling_granularity: str = "tensorwise",
 ):
     device = "cuda"
     print(f"Compile is set to             | {compile}")
@@ -112,10 +116,25 @@ def main(
     scaling_type_input = ScalingType(scaling_type_input)
     scaling_type_weight = ScalingType(scaling_type_weight)
     scaling_type_grad_output = ScalingType(scaling_type_grad_output)
+    scaling_granularity = ScalingGranularity(scaling_granularity)
+
+    cast_config_input = CastConfig(
+        scaling_type=scaling_type_input,
+        scaling_granularity=scaling_granularity,
+    )
+    cast_config_weight = CastConfig(
+        scaling_type=scaling_type_weight,
+        scaling_granularity=scaling_granularity,
+    )
+    cast_config_grad_output = CastConfig(
+        scaling_type=scaling_type_grad_output,
+        scaling_granularity=scaling_granularity,
+    )
+
     config = Float8LinearConfig(
-        cast_config_input=CastConfig(scaling_type=scaling_type_input),
-        cast_config_weight=CastConfig(scaling_type=scaling_type_weight),
-        cast_config_grad_output=CastConfig(scaling_type=scaling_type_grad_output),
+        cast_config_input=cast_config_input,
+        cast_config_weight=cast_config_weight,
+        cast_config_grad_output=cast_config_grad_output,
     )
 
     name_to_shapes = get_name_to_shapes_iter(shape_gen_name, M, K, N)
@@ -125,7 +144,6 @@ def main(
     else:
         use_fast_accum = [True, False]
     if shape_name_filter is not None:
-        k = shape_name_filter
         name_to_shapes = ((k, v) for (k, v) in name_to_shapes if k == shape_name_filter)
     experiment_list: List[Experiment] = []
     dtype = torch.bfloat16
@@ -142,7 +160,7 @@ def main(
             copy.deepcopy(linear_ref),
             config=config,
         )
-        scaling_repr = linear_float8.scaling_repr()
+        scaling_repr = linear_float8.extra_repr()
 
         if fast_accum:
             linear_float8.forward_config = ScaledMMConfig(False, True, False)
@@ -153,8 +171,6 @@ def main(
         ref_forw_backward = lambda: linear_ref(input_tensor).sum().backward()
 
         def float8_forw_backward():
-            if linear_requires_sync(config):
-                sync_float8_amax_and_scale_history(linear_float8)
             linear_float8(input_tensor).sum().backward()
 
         def n_times(n, fn, *args, **kwargs):
@@ -285,23 +301,26 @@ def invoke_main() -> None:
     parser.add_argument("--scaling_type_input", type=str, required=False)
     parser.add_argument("--scaling_type_weight", type=str, required=False)
     parser.add_argument("--scaling_type_grad_output", type=str, required=False)
+    parser.add_argument("--scaling_granularity", type=str, required=False)
     args = parser.parse_args()
     output_path = Path(args.output_path) if args.output_path is not None else None
     kwargs = {}
     if args.shape_gen_name is not None:
         kwargs["shape_gen_name"] = args.shape_gen_name
     if args.M is not None:
-        kwargs["M"] = args.M,
+        kwargs["M"] = (args.M,)
     if args.K is not None:
-        kwargs["K"] = args.K,
+        kwargs["K"] = (args.K,)
     if args.N is not None:
-        kwargs["N"] = args.N,
+        kwargs["N"] = (args.N,)
     if args.scaling_type_input is not None:
         kwargs["scaling_type_input"] = args.scaling_type_input
     if args.scaling_type_weight is not None:
         kwargs["scaling_type_weight"] = args.scaling_type_weight
     if args.scaling_type_grad_output is not None:
         kwargs["scaling_type_grad_output"] = args.scaling_type_grad_output
+    if args.scaling_granularity is not None:
+        kwargs["scaling_granularity"] = args.scaling_granularity
     main(
         output_path,
         not args.disable_compile,

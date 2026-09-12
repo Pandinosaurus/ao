@@ -1,0 +1,63 @@
+name: Run Regression Tests on ROCm
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - ciflow/rocm/*
+
+concurrency:
+  group: regression_test-${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+jobs:
+  test-nightly:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ROCM Nightly
+            runs-on: linux.rocm.gpu.ecosystem.mi350.1
+            torch-spec: '--pre torchvision torch --index-url https://download.pytorch.org/whl/nightly/rocm7.14'
+            gpu-arch-type: "rocm"
+            gpu-arch-version: "7.14"
+            docker-image: pytorch/manylinux2_28-builder:rocm7.14
+
+    permissions:
+      id-token: write
+      contents: read
+    uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
+    with:
+      timeout: 210
+      no-sudo: ${{ matrix.gpu-arch-type == 'rocm' }}
+      runner: ${{ matrix.runs-on }}
+      gpu-arch-type: ${{ matrix.gpu-arch-type }}
+      gpu-arch-version: ${{ matrix.gpu-arch-version }}
+      docker-image: ${{ matrix.docker-image }}
+      submodules: recursive
+      script: |
+        conda create -n venv python=3.10 -y
+        conda activate venv
+        python -m pip install --upgrade pip
+        pip install ${{ matrix.torch-spec }}
+        pip install -r dev-requirements.txt
+        # Editable install so build_ext --inplace drops the compiled extensions
+        # (e.g. the hipified torchao/_C*.so providing torchao::swizzle_mm) into the
+        # in-tree torchao/ dir. pytest is run from the repo root and, because test/ is
+        # a package with a conftest.py, prepends the repo root to sys.path -- so
+        # `import torchao` resolves to the source tree, which shadows the installed
+        # wheel. A non-editable `pip install .` leaves that source tree without the
+        # .so, so compiled ops (e.g. swizzle_mm) never register and their tests fail.
+        # Editable keeps the extensions available in the shadowing source tree.
+        pip install -e . --no-build-isolation
+        export CONDA=$(dirname $(dirname $(which conda)))
+        export LD_LIBRARY_PATH=$CONDA/lib/:$LD_LIBRARY_PATH
+        # PT2E tests (test/quantization/pt2e) are excluded here -- they are slow
+        # and CPU/x86-centric (the x86 Inductor tests self-skip on ROCm anyway).
+        # PT2E now runs in dedicated workflows: regression_test_pt2e_cpu.yml and
+        # regression_test_pt2e_gpu.yml.
+        pytest test --verbose -s --ignore=test/quantization/pt2e

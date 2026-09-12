@@ -1,5 +1,6 @@
 # Test utilities
-pytest==7.4.0
+pytest==9.0.3
+pytest-xdist==3.8.0
 unittest-xml-reporting
 parameterized
 packaging
@@ -7,13 +8,29 @@ transformers
 hypothesis # Avoid test derandomization warning
 sentencepiece # for gpt-fast tokenizer
 expecttest
+pyyaml
 
 # For prototype features and benchmarks
-bitsandbytes #needed for testing triton quant / dequant ops for 8-bit optimizers
+bitsandbytes # needed for testing triton quant / dequant ops for 8-bit optimizers
 matplotlib
 pandas
 fire  # QOL for commandline scripts
 tabulate  # QOL for printing tables to stdout
+tiktoken
+blobfile
+lm_eval
+# sam
+diskcache
+pycocotools
+tqdm
+importlib_metadata
 
 # Custom CUDA Extensions
 ninja
+
+# CPU kernels
+cmake<4.0.0,>=3.19.0
+
+# Linting
+ruff==0.11.6
+pre-commit

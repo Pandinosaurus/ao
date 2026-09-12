@@ -1,98 +1,116 @@
 Welcome to the torchao Documentation
-=======================================
+====================================
 
-**torchao** is an open-source library that provides the functionality
-to quantize and prune your models using native PyTorch. Our documentation is under development
-with more content coming soon.
+PyTorch-Native Training-to-Serving Model Optimization
+-----------------------------------------------------
 
-..
-   .. grid:: 3
+- Pre-train Llama-3.1-70B **1.5x faster** with float8 training
+- Recover **67% of quantized accuracy degradation** on Gemma3-4B with QAT
+- Quantize Llama-3-8B to int4 for **1.89x faster** inference with **58% less memory**
 
-      .. grid-item-card:: :octicon:`file-code;1em`
-         Getting Started
-         :img-top: _static/img/card-background.svg
-         :link: getting-started.html
-         :link-type: url
+`torchao <https://github.com/pytorch/ao>`__ is a library for custom data types and optimizations.
+Quantize and sparsify weights, gradients, optimizers, and activations for inference and training
+using native PyTorch. Please checkout torchao `README <https://github.com/pytorch/ao#torchao-pytorch-architecture-optimization>`__
+for an overall introduction to the library and recent highlight and updates.
 
-         Learn about how to get started with torchao
-         and ts application in your projects.
+Quick Start
+-----------
 
-      .. grid-item-card:: :octicon:`file-code;1em`
-         Concepts
-         :img-top: _static/img/card-background.svg
-         :link: dtypes.html
-         :link-type: url
+First, install TorchAO. We recommend installing the latest stable version:
 
-         Learn about the key torchao concepts such
-         as dtypes, quantization, sparsity, among others.
+.. code:: bash
 
-      .. grid-item-card:: :octicon:`file-code;1em`
-         API Reference
-         :img-top: _static/img/card-background.svg
-         :link: api_ref_intro.html
-         :link-type: url
+    pip install torchao
 
-         A comprehensive reference for the torchao
-         API and its functionalities.
+Quantize your model weights to int4!
 
-   Tutorials
-   ~~~~~~~~~
+.. code:: python
 
-   Ready to experiment? Check out some of the
-   torchao tutorials.
+    import torch
+    from torchao.quantization import Int4WeightOnlyConfig, quantize_
+    if torch.cuda.is_available():
+      # quantize on CUDA
+      quantize_(model, Int4WeightOnlyConfig(group_size=32, int4_packing_format="tile_packed_to_4d", int4_choose_qparams_algorithm="hqq"))
+    elif torch.xpu.is_available():
+      # quantize on XPU
+      quantize_(model, Int4WeightOnlyConfig(group_size=32, int4_packing_format="plain_int32"))
 
-   .. customcardstart::
+See our `first quantization example <eager_tutorials/first_quantization_example.html>`__ for more details.
 
-   .. customcarditem::
-      :header: Template Tutorial
-      :card_description: A placeholder template for demo purposes
-      :image: _static/img/generic-pytorch-logo.png
-      :link: tutorials/template_tutorial.html
-      :tags: template
+Installation
+------------
 
-   .. customcardend::
+To install the latest stable version:
 
+.. code:: bash
 
-.. ----------------------------------------------------------------------
-.. Below is the toctree i.e. it defines the content of the left sidebar.
-.. Each of the entry below corresponds to a file.rst in docs/source/.
-.. ----------------------------------------------------------------------
+    pip install torchao
 
-..
-   .. toctree::
-      :glob:
-      :maxdepth: 1
-      :caption: Getting Started
-      :hidden:
+Other installation options:
 
-      overview
-      getting-started
+.. code:: bash
 
-   .. toctree::
-      :glob:
-      :maxdepth: 1
-      :caption: Tutorials
-      :hidden:
+    # Nightly
+    pip install --pre torchao --index-url https://download.pytorch.org/whl/nightly/cu128
 
-      tutorials/template_tutorial
+    # Different CUDA versions
+    pip install torchao --index-url https://download.pytorch.org/whl/cu126  # CUDA 12.6
+    pip install torchao --index-url https://download.pytorch.org/whl/cu129  # CUDA 12.9
+    pip install torchao --index-url https://download.pytorch.org/whl/xpu    # XPU
+    pip install torchao --index-url https://download.pytorch.org/whl/cpu    # CPU only
+
+    # For developers
+    # Note: the --no-build-isolation flag is required.
+    USE_CUDA=1 pip install -e . --no-build-isolation
+    USE_XPU=1 pip install -e . --no-build-isolation
+    USE_CPP=0 pip install -e . --no-build-isolation
+
+Please see the `torchao compatibility table <https://github.com/pytorch/ao/issues/2919>`__ for version requirements for dependencies.
+
+Optional Dependencies
+^^^^^^^^^^^^^^^^^^^^^
+
+`MSLK <https://github.com/pytorch/MSLK>`__ is an optional runtime dependency that provides accelerated kernels for some of the workflows in torchao. Stable MSLK should be used with stable torchao, and nightly MSLK with nightly torchao.
+
+.. code:: bash
+
+    # Stable
+    pip install mslk-cuda==1.0.0
+
+    # Nightly
+    pip install --pre mslk --index-url https://download.pytorch.org/whl/nightly/cu128
+
+.. toctree::
+   :glob:
+   :maxdepth: 1
+   :caption: Workflows
+
+   workflows/index
 
 .. toctree::
    :glob:
    :maxdepth: 1
    :caption: API Reference
 
-   api_ref_sparsity
-   api_ref_intro
-   api_ref_quantization
-   api_ref_dtypes
-..
-      api_ref_kernel
-      
+   api_reference/index
+
 .. toctree::
    :glob:
    :maxdepth: 1
    :caption: Tutorials
-   :hidden:
 
-   serialization
-   
+   eager_tutorials/index
+
+.. toctree::
+   :glob:
+   :maxdepth: 1
+   :caption: Contributing
+
+   contributing/index
+
+.. toctree::
+   :glob:
+   :maxdepth: 1
+   :caption: PT2E Quantization
+
+   pt2e_quantization/index

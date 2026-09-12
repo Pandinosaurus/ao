@@ -1,44 +1,123 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-
-from .smoothquant import *  # noqa: F403
-from .quant_api import *  # noqa: F403
-from .subclass import *  # noqa: F403
-from .quant_primitives import *  # noqa: F403
-from .utils import *  # noqa: F403
-from .weight_only import *  # noqa: F403
-from .unified import *
-from .autoquant import *
-from .linear_activation_quantized_tensor import (  # noqat: F403
-    LinearActivationQuantizedTensor,
-    to_linear_activation_quantized,
+from .granularity import (
+    Granularity,
+    PerAxis,
+    PerBlock,
+    PerGroup,
+    PerRow,
+    PerTensor,
+    PerToken,
+)
+from .linear_quant_modules import (
+    Int4WeightOnlyQuantizer,
+    Int8DynActInt4WeightLinear,
+    Int8DynActInt4WeightQuantizer,
+)
+from .observer import (
+    AffineQuantizedMinMaxObserver,
+    AffineQuantizedObserverBase,
+)
+from .quant_api import (
+    Float8DynamicActivationFloat8WeightConfig,
+    Float8DynamicActivationInt4WeightConfig,
+    Float8MMConfig,
+    Float8StaticActivationFloat8WeightConfig,
+    Float8WeightOnlyConfig,
+    FqnToConfig,
+    Int4WeightOnlyConfig,
+    Int8DynamicActivationInt8WeightConfig,
+    Int8DynamicActivationIntxWeightConfig,
+    Int8StaticActivationInt8WeightConfig,
+    Int8WeightOnlyConfig,
+    IntxWeightOnlyConfig,
+    ModuleFqnToConfig,
+    fqn_matches_fqn_config,
+    intx_quantization_aware_training,
+    quantize_,
+    swap_conv2d_1x1_to_linear,
+)
+from .quant_primitives import (
+    MappingType,
+    TorchAODType,
+    ZeroPointDomain,
+    choose_qparams_affine,
+    choose_qparams_affine_with_min_max,
+    dequantize_affine,
+    quantize_affine,
+)
+from .quantize_.workflows import (
+    Float8Tensor,
+    Int4PlainInt32Tensor,
+    Int4PreshuffledTensor,
+    Int4Tensor,
+    Int4TilePackedTo4dTensor,
+    Int8Tensor,
+    IntxOpaqueTensor,
+    IntxUnpackedToInt8Tensor,
+    NF4Tensor,
+    to_nf4,
+)
+from .transform_module import register_quantize_module_handler
+from .utils import (
+    compute_error,
 )
 
+# TODO: remove after migration of APIs are done
+AOPerModuleConfig = ModuleFqnToConfig
+
 __all__ = [
-    "swap_conv2d_1x1_to_linear"
-    "safe_int_mm",
-    "autoquant",
-    "get_scale",
-    "SmoothFakeDynQuantMixin",
-    "SmoothFakeDynamicallyQuantizedLinear",
-    "swap_linear_with_smooth_fq_linear",
-    "smooth_fq_linear_to_inference",
-    "set_smooth_fq_attribute",
+    # top level API
+    "quantize_",
+    "intx_quantization_aware_training",
+    "fqn_matches_fqn_config",
+    "swap_conv2d_1x1_to_linear",
+    "Int8DynamicActivationInt8WeightConfig",
+    "Int8DynamicActivationIntxWeightConfig",
+    "Int8StaticActivationInt8WeightConfig",
+    "Int4WeightOnlyConfig",
+    "Float8DynamicActivationInt4WeightConfig",
+    "Int8WeightOnlyConfig",
+    "Float8WeightOnlyConfig",
+    "Float8DynamicActivationFloat8WeightConfig",
+    "Float8StaticActivationFloat8WeightConfig",
+    "IntxWeightOnlyConfig",
+    "AOPerModuleConfig",
+    "FqnToConfig",
+    "ModuleFqnToConfig",
+    # tensor subclasses
+    "Int8Tensor",
+    "Int4Tensor",
+    "Int4PlainInt32Tensor",
+    "Int4PreshuffledTensor",
+    "IntxOpaqueTensor",
+    "IntxUnpackedToInt8Tensor",
+    "Int4TilePackedTo4dTensor",
+    "Float8Tensor",
+    "NF4Tensor",
+    "to_nf4",
     "compute_error",
-    "Int4WeightOnlyGPTQQuantizer",
-    "Int4WeightOnlyQuantizer",
+    # building blocks
+    "AffineQuantizedMinMaxObserver",
+    "AffineQuantizedObserverBase",
+    # quant primitive ops
+    "choose_qparams_affine",
+    "choose_qparams_affine_with_min_max",
     "quantize_affine",
     "dequantize_affine",
-    "choose_qprams_affine",
-    "quantize_",
-    "int8_dynamic_activation_int4_weight",
-    "int8_dynamic_activation_int8_weight",
-    "int8_dynamic_activation_int8_semi_sparse_weight",
-    "int4_weight_only",
-    "int8_weight_only",
-    "LinearActivationQuantizedTensor",
-    "to_linear_activation_quantized",
+    # registration of module transforms for quantize_
+    "register_quantize_module_handler",
+    # dataclasses and types
+    "MappingType",
+    "ZeroPointDomain",
+    "TorchAODType",
+    "Granularity",
+    "PerTensor",
+    "PerAxis",
+    "PerBlock",
+    "PerGroup",
+    "PerRow",
+    "PerToken",
+    "Int4WeightOnlyQuantizer",
+    "Int8DynActInt4WeightQuantizer",
+    "Int8DynActInt4WeightLinear",
+    "Float8MMConfig",
 ]

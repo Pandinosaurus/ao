@@ -34,6 +34,7 @@ aten/build/
 aten/src/ATen/Config.h
 aten/src/ATen/cuda/CUDAConfig.h
 benchmarks/.data
+benchmarks/data
 caffe2/cpp_test/
 dist/
 docs/build/
@@ -45,6 +46,7 @@ docs/cpp/source/html/
 docs/cpp/source/latex/
 docs/source/compile/generated/
 docs/source/generated/
+docs/source/api_reference/generated/
 docs/source/compile/generated/
 log
 usage_log.txt
@@ -121,6 +123,7 @@ torch/utils/benchmark/utils/valgrind_wrapper/callgrind.h
 torch/utils/benchmark/utils/valgrind_wrapper/valgrind.h
 torch/version.py
 minifier_launcher.py
+torchao/prototype/spinquant/_hadamard_matrices.pkl
 # Root level file used in CI to specify certain env configs.
 # E.g., see .circleci/config.yaml
 env
@@ -262,7 +265,7 @@ docs/dev
 docs/build
 docs/source/tutorials/*
 docs/source/gen_modules/*
-docs/source/sg_execution_times
+docs/source/sg_execution_times.rst
 
 # LevelDB files
 *.sst
@@ -372,3 +375,11 @@ sweep/
 
 # Model checkpoints
 checkpoints/
+
+# Experimental
+torchao/experimental/cmake-out
+torchao/experimental/deps
+
+# local claude code files
+CLAUDE.local.md
+.claude

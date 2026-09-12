@@ -4,56 +4,17 @@
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 import logging
-from typing import Callable, List, Optional
+from functools import partial
+from typing import Callable, List, Optional, Union
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
-from torchao.float8.config import Float8LinearConfig, ScalingType
-from torchao.float8.float8_linear import Float8Linear
 
-from torchao.float8.float8_utils import (
-    amax_history_to_scale_stack,
-    e4m3_dtype,
-    e5m2_dtype,
-)
-from torch.distributed._functional_collectives import all_reduce, AsyncCollectiveTensor
+from torchao.float8.config import Float8LinearConfig, Float8LinearRecipeName
+from torchao.float8.float8_linear import Float8Linear
 
 log = logging.getLogger(__name__)
 log.addHandler(logging.NullHandler())
-
-
-def linear_requires_sync(config: Float8LinearConfig):
-    """Returns whether the given linear_type requires sync before forward."""
-    return any(
-        [
-            config.cast_config_input.scaling_type is ScalingType.DELAYED,
-            config.cast_config_weight.scaling_type is ScalingType.DELAYED,
-            config.cast_config_grad_output.scaling_type is ScalingType.DELAYED,
-        ]
-    )
-
-
-def _update_history_stack(
-    new_amax: torch.Tensor, amax_history_stack: torch.Tensor
-) -> torch.Tensor:
-    """
-    Updates `amax_history` (the last N cur_amax values) inplace with the value
-    of `new_amax`.
-
-    Args:
-        new_amax (torch.Tensor): The new amax value to add to the history. (n_amaxes, 1)
-        amax_history_stack (torch.Tensor): The history of amax values. (n_amaxes, history_length)
-    """
-    assert (
-        amax_history_stack.dim() == 2
-    ), f"Expected amat_history_stack to be 2D, got {amax_history_stack.shape()}"
-    assert new_amax.size(0) == amax_history_stack.size(
-        0
-    ), f"Expected new_amax to have the same size as the first dimension of amax_history_stack, got {new_amax.size(0)} and {amax_history_stack.size(0)}"
-    new_amax_history_stack = torch.roll(amax_history_stack, 1, dims=1)
-    new_amax_history_stack[:, 0] = new_amax.squeeze(-1)
-    amax_history_stack.copy_(new_amax_history_stack)
 
 
 def swap_linear_layers(
@@ -111,9 +72,9 @@ def swap_linear_layers(
         if isinstance(module, nn.Linear) and (
             module_filter_fn is None or module_filter_fn(module, cur_fqn)
         ):
-            assert (
-                parent_module is not None
-            ), f"Linear root module should return early: {module}"
+            assert parent_module is not None, (
+                f"Linear root module should return early: {module}"
+            )
             new_linear_module = from_float_func(module)
             cur_module_name = cur_fqn.split(".")[-1]
             setattr(parent_module, cur_module_name, new_linear_module)
@@ -126,7 +87,7 @@ def convert_to_float8_training(
     module: nn.Module,
     *,
     module_filter_fn: Optional[Callable[[nn.Module, str], bool]] = None,
-    config: Float8LinearConfig = None,
+    config: Optional[Float8LinearConfig] = None,
 ) -> nn.Module:
     """
     Swaps `torch.nn.Linear` in `module` with `Float8Linear`.
@@ -140,13 +101,31 @@ def convert_to_float8_training(
 
     Returns:
      nn.Module: The modified module with swapped linear layers.
+
+    Example:
+
+    .. literalinclude:: ../../examples/float8_training_example.py
+       :language: python
     """
+    torch._C._log_api_usage_once("torchao.float8.convert_to_float8_training")
+
+    # Work around a Triton fp8 store miscompile triggered by inductor's
+    # PropagateNan.ALL min/max codegen (triton-lang/triton#11111). Scoped to the
+    # float8 training entry point (rather than at import) so it only affects users
+    # who actually convert a model to float8 training, and is applied here before
+    # any float8 kernel is compiled.
+    from torchao.float8._inductor_patch import _patch_inductor_min_max_codegen
+
+    _patch_inductor_min_max_codegen()
+
     if config is None:
         config = Float8LinearConfig()
+
     from_float = lambda m: Float8Linear.from_float(
         m,
         config=config,
     )
+
     return swap_linear_layers(
         module,
         from_float,
@@ -154,174 +133,83 @@ def convert_to_float8_training(
     )
 
 
-def get_float8_layers(model: torch.nn.Module):
-    """Iterates through the model and returns all the Float8Linear layers.
-    Args:
-        model (torch.nn.Module): The model to look for Float8Linear layers in.
+def _auto_filter_for_recipe(
+    recipe: Union[str, Float8LinearRecipeName], filter_fqns: List[str]
+) -> Callable[[nn.Module, str], bool]:
+    """Returns function which automatically filters nn.Linear modules that meet at least one of the following criteria:
+
+    1. Dims not divisible by 16 (hardware requirement for float8).
+    2. Dim sizes below certain thresholds, which may result in worse performance.
+
+    NOTE: the thresholds are simple heuristics based on performance testing, and may not be optimal
+    for your model. For the best performance, we recommend defining your own module_filter_fn customized for
+    your module, using the performance tables for the given float8 recipe here:
+    https://github.com/pytorch/ao/tree/main/torchao/float8#performance). These benchmarks referenced for
+    auto filtering layers were run on H100 GPUs, and may not be representative of other hardware.
+
+    This is an experimental API, the design may change in the future.
     """
+    if isinstance(recipe, str):
+        recipe = Float8LinearRecipeName(recipe)
+    if recipe == Float8LinearRecipeName.TENSORWISE:
+        return partial(_auto_filter_for_tensorwise, filter_fqns=filter_fqns)
+    elif recipe == Float8LinearRecipeName.ROWWISE:
+        return partial(_auto_filter_for_rowwise, filter_fqns=filter_fqns)
+    elif recipe == Float8LinearRecipeName.ROWWISE_WITH_GW_HP:
+        raise NotImplementedError(f"Unsupported recipe: {recipe}")
+    else:
+        raise ValueError(f"Invalid recipe: {recipe}")
 
-    # Get all fp8 layers and tensors
-    fp8_layers = [child for child in model.modules() if isinstance(child, Float8Linear)]
-    if not torch.compiler.is_compiling():
-        for layer in fp8_layers:
-            for buf in layer.buffers():
-                torch._dynamo.mark_static_address(buf, guard=True)
-    return fp8_layers
+
+def _auto_filter_for_rowwise(mod: nn.Module, fqn: str, filter_fqns: List[str]) -> bool:
+    if not isinstance(mod, nn.Linear):
+        return False
+
+    # If the fqn matches any filtered fqn, then we should not convert this module.
+    is_filtered_fqn = any(filter_fqn in fqn for filter_fqn in filter_fqns)
+    if is_filtered_fqn:
+        return False
+
+    # All dims must be divisible by 16 due to float8 hardware requirements.
+    N, K = mod.weight.shape
+    dims_multiples_of_16 = K % 16 == 0 and N % 16 == 0
+    if not dims_multiples_of_16:
+        return False
+
+    # Dims below these thresholds may result in worse performance
+    # (see https://github.com/pytorch/ao/tree/main/torchao/float8#rowwise-scaling)
+    # Note that these benchmarks referenced for auto filtering layers were run on
+    # H100 GPUs, and may not be representative of other hardware.
+    if N <= 2048:
+        return False
+    elif K <= 1024:
+        return False
+    elif N <= 4096 and K <= 2048:
+        return False
+    return True
 
 
-@torch.no_grad()
-def sync_float8_amax_and_scale_history(model: torch.nn.Module, fp8_layers=None) -> None:
-    """
-    Manages the float8 amax and scale bookkeeping. In detail, it does the
-    following:
-    1. in distributed contexts, syncs amax values across workers for activations and gradients
-    2. adds the `amax` values to history
-    3. calculates the scales to be used for next iteration
-    4. sets the `amax_and_scale_synced` flag on the Float8Linear modules
-       to signal that they have been synced
+def _auto_filter_for_tensorwise(
+    mod: nn.Module, fqn: str, filter_fqns: List[str]
+) -> bool:
+    if not isinstance(mod, nn.Linear):
+        return False
 
-    TODO(future): design the UX for this (context manager, etc)
+    # If the fqn matches any filtered fqn, then we should not convert this module.
+    is_filtered_fqn = any(filter_fqn in fqn for filter_fqn in filter_fqns)
+    if is_filtered_fqn:
+        return False
 
-    PERFORMANCE NOTE:
-        When you can, it is much more efficient to call get_float8_layers once at
-        the beginning of the training loop and pass the result to this function.
-        Because of how this interacts with torch.compile
+    # All dims must be divisible by 16 due to float8 hardware requirements.
+    N, K = mod.weight.shape
+    dims_multiples_of_16 = K % 16 == 0 and N % 16 == 0
+    if not dims_multiples_of_16:
+        return False
 
-    Args:
-        model (torch.nn.Module): The model to track amaxes for
-        fp8_layers (optional): If fp8_layers are provided, fp8_classes are ignored,
-            and we loop over all fp8_layers to sync and update amax scale histories.
-            Users can use get_float8_layers to get all fp8 layers.
-    """
-    if fp8_layers is None:
-        fp8_layers = get_float8_layers(model)
-
-    if len(fp8_layers) == 0:
-        log.warn(
-            "Calling sync_float8_amax_and_scale_history on a module with no Float8Linear layers"
-        )
-        return
-
-    def inner_func():
-        """Why do we have this inner_function?
-
-        There are two portions of the outer sync_function that cause graph_breaks:
-            1. The `get_float8_layers` call can cause graph breaks if the user did not pass
-                in the fp8_layers.
-            2. At the end of syncing all the amaxes and scales we set the attr on the module
-                signaling that we have synced the amaxes and scales and the next forward can be run.
-                # TODO Maybe we should remove this safety check to remove the graph break?
-
-        By having this inner function, we can ensure that although the outer function may cause graph breaks
-        the inner function will not.
-        """
-        # Loop over all fp8 layers and grab the needed tensors
-        fp8_amax_input_tensor_list = [None] * len(fp8_layers)
-        fp8_amax_weight_tensor_list = [None] * len(fp8_layers)
-        fp8_amax_grad_output_tensor_list = [None] * len(fp8_layers)
-
-        fp8_input_amax_history_stack = [None] * len(fp8_layers)
-        fp8_weight_amax_history_stack = [None] * len(fp8_layers)
-        fp8_grad_output_amax_history_stack = [None] * len(fp8_layers)
-
-        x_dtypes = set()
-        scale_fn_recipes = set()
-
-        for idx, child in enumerate(fp8_layers):
-            fp8_amax_input_tensor_list[idx] = child.fp8_amax_input
-            fp8_amax_weight_tensor_list[idx] = child.fp8_amax_weight
-            fp8_amax_grad_output_tensor_list[idx] = child.fp8_amax_grad_output
-
-            fp8_input_amax_history_stack[idx] = child.fp8_amax_history_input
-            fp8_weight_amax_history_stack[idx] = child.fp8_amax_history_weight
-            fp8_grad_output_amax_history_stack[idx] = child.fp8_amax_history_grad_output
-
-            x_dtypes.add(child.last_seen_input_dtype)
-            scale_fn_recipes.add(child.config.delayed_scaling_config.scale_fn_name)
-
-        # TODO This way to get the activation dtype is not ideal
-        if len(x_dtypes) != 1:
-            raise ValueError(
-                f"All layers must have the same last seen input_dtype, got {x_dtypes}"
-            )
-        x_dtype = next(iter(x_dtypes))
-
-        if len(scale_fn_recipes) != 1:
-            raise ValueError(
-                f"All layers must have the same scale_fn recipe, got {scale_fn_recipes}"
-            )
-        scale_fn_recipe = next(iter(scale_fn_recipes))
-
-        assert (
-            len(fp8_amax_input_tensor_list)
-            == len(fp8_amax_weight_tensor_list)
-            == len(fp8_amax_grad_output_tensor_list)
-        ), "Mismatched lengths of amax tensors."
-
-        if dist.is_initialized():
-            all_amax_tensors = torch.cat(
-                fp8_amax_input_tensor_list
-                + fp8_amax_weight_tensor_list
-                + fp8_amax_grad_output_tensor_list
-            )
-            all_reduced_amax_tensor = all_reduce(
-                all_amax_tensors, "MAX", list(range(dist.get_world_size()))
-            )
-            if isinstance(all_reduced_amax_tensor, AsyncCollectiveTensor):
-                all_reduced_amax_tensor = all_reduced_amax_tensor.wait()
-
-            (
-                reduced_fp8_amax_input_tensor,
-                reduced_fp8_amax_weight_tensor,
-                reduced_fp8_amax_grad_output_tensor,
-            ) = torch.split(all_reduced_amax_tensor, len(fp8_amax_input_tensor_list))
-
-            for idx, child in enumerate(fp8_layers):
-                child.fp8_amax_input.copy_(reduced_fp8_amax_input_tensor[idx])
-                child.fp8_amax_weight.copy_(reduced_fp8_amax_weight_tensor[idx])
-                child.fp8_amax_grad_output.copy_(
-                    reduced_fp8_amax_grad_output_tensor[idx]
-                )
-
-        # We create two stacked tensor groups, one for the amax history and one for the current scales
-        fp8_amax_input_tensors = torch.vstack(fp8_amax_input_tensor_list)
-        fp8_amax_weight_tensors = torch.vstack(fp8_amax_weight_tensor_list)
-        fp8_amax_grad_output_tensors = torch.vstack(fp8_amax_grad_output_tensor_list)
-
-        fp8_input_amax_history_stack = torch.vstack(fp8_input_amax_history_stack)
-        fp8_weight_amax_history_stack = torch.vstack(fp8_weight_amax_history_stack)
-        fp8_grad_output_amax_history_stack = torch.vstack(
-            fp8_grad_output_amax_history_stack
-        )
-
-        # Update the history stacks with the new amax values
-        _update_history_stack(fp8_amax_input_tensors, fp8_input_amax_history_stack)
-        _update_history_stack(fp8_amax_weight_tensors, fp8_weight_amax_history_stack)
-        _update_history_stack(
-            fp8_amax_grad_output_tensors, fp8_grad_output_amax_history_stack
-        )
-
-        # Calculate the new scales from the updated history stacks
-        new_input_scales = amax_history_to_scale_stack(
-            fp8_input_amax_history_stack, e4m3_dtype, x_dtype, scale_fn_recipe
-        )
-        new_weight_scales = amax_history_to_scale_stack(
-            fp8_weight_amax_history_stack, e4m3_dtype, x_dtype, scale_fn_recipe
-        )
-        new_grad_output_scales = amax_history_to_scale_stack(
-            fp8_grad_output_amax_history_stack, e5m2_dtype, x_dtype, scale_fn_recipe
-        )
-
-        # Iterate through the layers and update the scales
-        for idx, child in enumerate(fp8_layers):
-            child.fp8_scale_input.copy_(new_input_scales[idx])
-            child.fp8_scale_weight.copy_(new_weight_scales[idx])
-            child.fp8_scale_grad_output.copy_(new_grad_output_scales[idx])
-
-    # This allows for the compile to succede on the inner func and fail on the graph breaks
-    # at the beginning and and of syncing
-    inner_func()
-
-    for child in fp8_layers:
-        # Set a flag to signal amaxes/scales are ready
-        child.amax_and_scale_synced = True
+    # Dims below these thresholds may result in worse performance
+    # (see https://github.com/pytorch/ao/tree/main/torchao/float8#tensorwise-scaling)
+    # Note that these benchmarks referenced for auto filtering layers were run on
+    # H100 GPUs, and may not be representative of other hardware.
+    if K <= 4096 and N <= 1024:
+        return False
+    return True

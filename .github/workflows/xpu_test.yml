@@ -1,0 +1,157 @@
+# TODO: this looks sort of similar to _linux-test, but there are like a dozen
+# places where you would have to insert an if statement. Probably it's better to
+# just use a different workflow altogether
+
+name: xpu-test
+
+on:
+  push:
+    tags:
+      - ciflow/xpu/*
+  workflow_dispatch:
+  schedule:
+    # Every Saturday at 4 PM UTC
+    - cron: '0 16 * * 6'
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: xpu_ci_test-${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # Don't run on forked repos or empty test matrix
+    # if: github.repository_owner == 'pytorch' && toJSON(fromJSON(inputs.test-matrix).include) != '[]'
+    timeout-minutes: 120
+    runs-on: linux.idc.xpu
+    env:
+      DOCKER_IMAGE: ci-image:pytorch-linux-noble-xpu-n-py3
+      PYTORCH_RETRY_TEST_CASES: 1
+      PYTORCH_OVERRIDE_FLAKY_SIGNAL: 1
+      XLA_CLANG_CACHE_S3_BUCKET_NAME: ossci-compiler-clang-cache-circleci-xla
+    steps:
+      - name: Checkout PyTorch
+        uses: actions/checkout@v4
+        with:
+          repository: pytorch/pytorch
+          ref: nightly
+          path: pytorch
+          fetch-depth: 1
+          submodules: false
+    
+      - name: Checkout Torchao (ao)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.head_ref || github.ref }}
+          path: torchao
+          fetch-depth: 1
+          submodules: recursive
+
+      # Runner health checks, GPU_FLAG, env preservation and ECR login are all
+      # handled by the shared setup-xpu action from pytorch/pytorch.
+      - name: Setup XPU
+        uses: pytorch/pytorch/.github/actions/setup-xpu@main
+
+      - name: Calculate docker image
+        id: calculate-docker-image
+        uses: pytorch/test-infra/.github/actions/calculate-docker-image@main
+        with:
+          docker-image-name: ${{ env.DOCKER_IMAGE }}
+          working-directory: pytorch
+          repo-name: pytorch
+
+      - name: Use following to pull public copy of the image
+        id: print-ghcr-mirror
+        env:
+          ECR_DOCKER_IMAGE: ${{ steps.calculate-docker-image.outputs.docker-image }}
+        shell: bash
+        run: |
+          tag=${ECR_DOCKER_IMAGE##*:}
+          echo "docker pull ghcr.io/pytorch/ci-image:${tag/:/-}"
+
+      - name: Pull docker image
+        uses: pytorch/test-infra/.github/actions/pull-docker-image@main
+        with:
+          docker-image: ${{ steps.calculate-docker-image.outputs.docker-image }}
+
+      - name: Test
+        id: test
+        env:
+          TEST_COMMAND: torchao/.github/scripts/ci_test_xpu.sh
+          DOCKER_IMAGE: ${{ steps.calculate-docker-image.outputs.docker-image }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_WORKFLOW: ${{ github.workflow }}
+          GITHUB_JOB: ${{ github.job }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+          SHA1: ${{ github.event.pull_request.head.sha || github.sha }}
+        timeout-minutes: 120
+        run: |
+          set -x
+
+          # detached container should get cleaned up by teardown_ec2_linux
+          # Used for GPU_FLAG since that doesn't play nice
+          # shellcheck disable=SC2086,SC2090
+          container_name=$(docker run \
+            ${GPU_FLAG:-} \
+            -e PR_NUMBER \
+            -e GITHUB_ACTIONS \
+            -e GITHUB_REPOSITORY \
+            -e GITHUB_WORKFLOW \
+            -e GITHUB_JOB \
+            -e GITHUB_RUN_ID \
+            -e GITHUB_RUN_NUMBER \
+            -e GITHUB_RUN_ATTEMPT \
+            -e JOB_ID \
+            -e BRANCH \
+            -e SHA1 \
+            --user $(id -u):$(id -g) \
+            --ulimit stack=10485760:83886080 \
+            --ulimit core=0 \
+            --security-opt seccomp=unconfined \
+            --cap-add=SYS_PTRACE \
+            --shm-size="8g" \
+            --tty \
+            --detach \
+            --name="${container_name}" \
+            --user jenkins \
+            --privileged \
+            -v "${GITHUB_WORKSPACE}:/var/lib/jenkins/workspace" \
+            -w /var/lib/jenkins/workspace \
+            "${DOCKER_IMAGE}"
+          )
+          # save container name for later step
+          echo "CONTAINER_NAME=${container_name}" >> "$GITHUB_ENV"
+          # jenkins user does not have write permission to mounted workspace; work-around by copying within container to jenkins home
+          docker exec -t "${container_name}" sh -c "bash ${TEST_COMMAND}"
+
+      - name: Collect backtraces from coredumps (if any)
+        if: always()
+        run: |
+          # shellcheck disable=SC2156
+          find . -iname "core.[1-9]*" -exec docker exec "${CONTAINER_NAME}" sh -c "gdb python {} -ex 'bt' -ex 'q'" \;
+
+      - name: Stop container before exit
+        if: always()
+        run: |
+          # Workaround for multiple runners on same IDC node
+          docker stop "${{ env.CONTAINER_NAME }}"
+
+      - name: Store Core dumps on GitHub
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: failure()
+        with:
+          name: coredumps-${{ matrix.config }}-${{ matrix.shard }}-${{ matrix.num_shards }}-${{ matrix.runner }}
+          retention-days: 14
+          if-no-files-found: ignore
+          path: ./**/core.[1-9]*
+
+      - name: Teardown XPU
+        uses: pytorch/pytorch/.github/actions/teardown-xpu@main
+        if: always()

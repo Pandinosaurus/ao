@@ -9,14 +9,22 @@ import json
 import re
 from typing import Optional
 
+import torch.utils.benchmark as benchmark
+from torch.profiler import ProfilerActivity, profile
+
+DSV3_16B_671B_SHAPE_GEN_NAME = "dsv3-16b-671b"
+DSV3_16B_671B_SEQ_LEN = 4096
+DSV3_16B_671B_DIM = 7168
+DSV3_16B_671B_INTER_DIM = 18432
+
 
 def profiler_output_to_filtered_time_by_kernel_name(
-    prof, 
+    prof,
     num_iter: int,
     num_leaf_tensors: int,
 ):
     """
-    Input: 
+    Input:
       * `prof`: a profiler with captured events
       * `num_iter`: number of iterations used to capture `prof`
       * `num_leaf_tensors`: number of leaf tensors to accumulate gradients to
@@ -27,7 +35,7 @@ def profiler_output_to_filtered_time_by_kernel_name(
     set up as follows:
 
         #
-        # Forward pass 
+        # Forward pass
         #
 
         # Expected GPU kernel overhead: none
@@ -58,7 +66,6 @@ def profiler_output_to_filtered_time_by_kernel_name(
     thresh = 1e-10
     kernel_name_to_gpu_time_us = collections.defaultdict(float)
     for e in key_averages:
-
         # manually filter top-level CPU events with attributed CUDA time
         # example CPU event row from printing `key_averages`:
         #                                               aten::addmm         0.83%      76.554us         0.98%      90.846us      90.846us       1.022ms        31.82%       1.022ms       1.022ms             1
@@ -68,23 +75,22 @@ def profiler_output_to_filtered_time_by_kernel_name(
             continue
 
         # manually filter expected microbenchmarking overhead, in order of execution
-        if e.key == 'aten::sum':
+        if e.key == "aten::sum":
             # forward pass sum
-            assert e.count == num_iter, f'unexpected number of iter for {e.key}'
+            assert e.count == num_iter, f"unexpected number of iter for {e.key}"
             continue
-        elif e.key == 'aten::fill_':
-            # filling the forward pass sum with 1.0
-            assert e.count == num_iter, f'unexpected number of iter for {e.key}'
-            continue
-        elif e.key == 'aten::copy_':
-            # copying 1.0 from grad_out of `sum` to grad_out of next op
-            assert e.count == num_iter, f'unexpected number of iter for {e.key}'
-            continue
-        elif e.key == 'aten::add_':
+        elif e.key == "aten::add_":
             # accumulating gradients into leaf tensors
-            assert e.count == (num_iter * num_leaf_tensors), f'unexpected number of iter for {e.key}'
+            assert e.count == (num_iter * num_leaf_tensors), (
+                f"unexpected number of iter for {e.key}"
+            )
             continue
-        elif e.key == 'cudaDeviceSynchronize':
+        elif e.key in ("cudaDeviceSynchronize", "hipDeviceSynchronize"):
+            continue
+        elif e.key == "Activity Buffer Request":
+            continue
+        elif e.key == "Unrecognized":
+            # TODO I think these are nvjet related
             continue
 
         kernel_name_to_gpu_time_us[e.key] = e.self_device_time_total
@@ -107,25 +113,16 @@ def profiler_output_to_gpu_time_for_key(prof, key):
 
 def kernel_name_to_category(k):
     # number prefix is for easy sorting
-    if k in ("aten::mm", "aten::addmm", "aten::_scaled_mm"):
-        return "0_gemm"
-    elif (
-        # max(abs(tensor))
-        ("abs" in k and "max" in k)
-        or
-        # casting pointwise to float8
-        ("clamp" in k)
-        or
-        # things related to scaled_mm
-        ("scaled_mm" in k)
-        or
-        # syncing amaxes and scales
-        ("roll" in k)
+    if k in (
+        "aten::mm",
+        "aten::addmm",
+        "aten::_scaled_mm",
+        "aten::_scaled_mm_v2",
+        "torchao::mx_fp8_bf16",
     ):
-        # note: the above filter is approximate and will give false
-        # positives if model code contains other code to abs/max/clamp
-        return "1_f8_overhead"
-    return "2_other"
+        return "0_gemm"
+    else:
+        return "1_other"
 
 
 def parse_bw_and_kernel_name(line):
@@ -134,7 +131,7 @@ def parse_bw_and_kernel_name(line):
         0.257ms         0.537 GB         2092.43GB/s     triton_red_fused_native_layer_norm_0
     Output: the bandwidth value and the kernel name, or None and None
     """
-    result = re.search(".* ([0-9\.]+)GB/s.*(triton_[a-z_0-9]+)", line)
+    result = re.search(r".* ([0-9\.]+)GB/s.*(triton_[a-z_0-9]+)", line)
     if result:
         return result.group(1), result.group(2)
     else:
@@ -147,9 +144,10 @@ def get_name_to_shapes_iter(
     K: Optional[int],
     N: Optional[int],
 ):
-    if shape_gen_name == 'llama':
-        assert M == K == N == None, \
-            f'M, K, N arguments not supported for shape_gen_name {shape_gen_name}'
+    if shape_gen_name == "llama":
+        assert M == K == N == None, (
+            f"M, K, N arguments not supported for shape_gen_name {shape_gen_name}"
+        )
         bsz, seq_len = 4, 4096
         M = bsz * seq_len
         # LLaMa 2 70B single-node weight shapes
@@ -163,43 +161,134 @@ def get_name_to_shapes_iter(
         }
         return name_to_shapes_70b.items()
 
-    elif shape_gen_name == 'square':
-        assert M == K == N == None, \
-            f'M, K, N arguments not supported for shape_gen_name {shape_gen_name}'
+    elif shape_gen_name == "pow2":
+        assert M == K == N == None, (
+            f"M, K, N arguments not supported for shape_gen_name {shape_gen_name}"
+        )
         name_to_shapes = {}
-        min_power_of_2 = 5  # 32
-        max_power_of_2 = 16  # 65,536
+        min_power_of_2 = 10  # 1024
+        max_power_of_2 = 14  # 16,384
         for idx, power_of_2 in enumerate(range(min_power_of_2, max_power_of_2 + 1)):
-            val = 2 ** power_of_2
+            val = 2**power_of_2
             name_to_shapes[idx] = val, val, val
         return name_to_shapes.items()
 
-    elif shape_gen_name == 'sweep':
-        assert M == K == N == None, \
-            f'M, K, N arguments not supported for shape_gen_name {shape_gen_name}'
+    elif shape_gen_name == "pow2_extended":
+        assert M == K == N == None, (
+            f"M, K, N arguments not supported for shape_gen_name {shape_gen_name}"
+        )
         name_to_shapes = {}
-        min_p2 = 5  # 32
-        max_p2 = 16  # 65,536
+        min_power_of_2 = 10  # 1024
+        max_power_of_2 = 14  # 16,384
+        for idx, power_of_2 in enumerate(range(min_power_of_2, max_power_of_2 + 1)):
+            val1 = 2**power_of_2
+            name_to_shapes[idx * 2] = val1, val1, val1
+            val2 = 2**power_of_2 + 2 ** (power_of_2 - 1)
+            name_to_shapes[idx * 2 + 1] = val2, val2, val2
+        return name_to_shapes.items()
+
+    elif shape_gen_name == "sweep":
+        assert M == K == N == None, (
+            f"M, K, N arguments not supported for shape_gen_name {shape_gen_name}"
+        )
+        name_to_shapes = {}
+        min_p2 = 8  # 256
+        max_p2 = 15  # 32,768
         counter = 0
         for M_p2 in range(min_p2, max_p2 + 1):
-            M = 2 ** M_p2
+            M = 2**M_p2
             for K_p2 in range(min_p2, max_p2 + 1):
-                K = 2 ** K_p2
+                K = 2**K_p2
                 for N_p2 in range(min_p2, max_p2 + 1):
-                    N = 2 ** N_p2
+                    N = 2**N_p2
                     name_to_shapes[counter] = M, K, N
                     counter += 1
         return name_to_shapes.items()
 
-    elif shape_gen_name == 'custom':
-        assert M is not None and K is not None and N is not None, \
-            'M, K, N must be specified for custom shape_gen'
+    elif shape_gen_name == "custom":
+        assert M is not None and K is not None and N is not None, (
+            "M, K, N must be specified for custom shape_gen"
+        )
         name_to_shapes = {
             1: (M, K, N),
         }
         return name_to_shapes.items()
 
-    raise AssertionError(f'unknown shape_gen_name {shape_gen_name}')
+    elif shape_gen_name == "dsv3-671b":
+        # DeepSeek-V3 671B model shapes
+        assert K == N == None, (
+            f"K, N arguments not supported for shape_gen_name {shape_gen_name}"
+        )
+
+        M = (
+            M if M is not None else 81920
+        )  # default to local_bs=10, seq_len=8192 -> 81920
+
+        name_to_shapes = {
+            "attn.wq_a": (M, 7168, 1536),
+            "attn.wq_b": (M, 1536, 24576),
+            "attn.wo": (M, 16384, 7168),
+            "attn.wkv_a": (M, 7168, 576),
+            "attn.wkv_b": (M, 512, 32768),
+            "ffn.w1": (M, 7168, 18432),
+            "ffn.w2": (M, 18432, 7168),
+            "ffn.w3": (M, 7168, 18432),
+            "moe.shared_experts.w1": (M, 7168, 2048),
+            "moe.shared_experts.w2": (M, 2048, 7168),
+            "moe.shared_experts.w3": (M, 7168, 2048),
+        }
+        return name_to_shapes.items()
+
+    elif shape_gen_name == DSV3_16B_671B_SHAPE_GEN_NAME:
+        seq_len = M if M is not None else DSV3_16B_671B_SEQ_LEN
+        dim = K if K is not None else DSV3_16B_671B_DIM
+        inter_dim = N if N is not None else DSV3_16B_671B_INTER_DIM
+
+        name_to_shapes = {
+            "dsv3.ffn.w1": (seq_len, dim, inter_dim),
+            "dsv3.ffn.w2": (seq_len, inter_dim, dim),
+            "dsv3.ffn.w3": (seq_len, dim, inter_dim),
+        }
+        return name_to_shapes.items()
+
+    raise AssertionError(f"unknown shape_gen_name {shape_gen_name}")
+
+
+def get_name_to_moe_shapes_iter(
+    shape_gen_name: str,
+    M: Optional[int] = None,
+    K: Optional[int] = None,
+    N: Optional[int] = None,
+    E: Optional[int] = None,
+):
+    M = 16640 if M is None else M
+    if shape_gen_name == "llama4_17bx16e":
+        # num_experts=16, dim=5120
+        names_to_shapes = {
+            # M, K, N, E
+            "moe.experts.w1": (M, 5120, 8192, 16),
+            "moe.experts.w2": (M, 8192, 5120, 16),
+        }
+        return names_to_shapes.items()
+    elif shape_gen_name == "llama4_17bx128e":
+        # num_experts=128, dim=5120
+        names_to_shapes = {
+            # M, K, N, E
+            "moe.experts.w1": (M, 5120, 4 * 5120, 128),
+            "moe.experts.w2": (M, 4 * 5120, 5120, 128),
+        }
+        return names_to_shapes.items()
+    elif shape_gen_name == "custom":
+        assert M is not None and K is not None and N is not None and E is not None, (
+            "M, K, N, E must be specified for custom shape_gen"
+        )
+        name_to_shapes = {
+            1: (M, K, N, E),
+        }
+        return name_to_shapes.items()
+
+    raise AssertionError(f"unknown shape_gen_name {shape_gen_name}")
+
 
 # copy-pasta from https://github.com/vkuzo/pytorch_scripts/blob/main/add_inductor_metadata_to_perf_trace.py
 def update_triton_kernels_in_prof_chome_trace_with_torch_logs(
@@ -208,34 +297,31 @@ def update_triton_kernels_in_prof_chome_trace_with_torch_logs(
     modified_perf_trace_file: str,
 ):
     """
-    Input 1: a perf trace generated by using `torch.profiler.profile` inside of 
+    Input 1: a perf trace generated by using `torch.profiler.profile` inside of
       some_program.py, and containing torch.compile + inductor kernels
-    Input 2: a text file with the output of 
+    Input 2: a text file with the output of
       TORCH_LOGS="output_code" python some_program.py
     Input 3: filename for the modified perf trace
 
     This script does the following for each triton kernel in input 1:
     - navigate to the kernel information in the logs from input 2
-    - copy over the kernel metadata (aten graph, triton code, etc) to the JSON 
+    - copy over the kernel metadata (aten graph, triton code, etc) to the JSON
       in input 1
 
-    The end result is that Input 1 is modified so that the kernel metadata is 
+    The end result is that Input 1 is modified so that the kernel metadata is
     directly visible in tools like chrome://tracing and perfetto.
     """
 
-    external_id_to_cpu_ops = dict()
-    external_id_to_kernels = dict()
-
     # open the torch logs file
     torch_logs_str = None
-    with open(torch_logs_file, 'r') as f:
+    with open(torch_logs_file, "r") as f:
         torch_logs_str = f.readlines()
 
     # strip away the torch_logs prefix
     torch_logs_only = []
     for line in torch_logs_str:
-        line = line.replace('\n', '')
-        match = re.match('.* \[__output_code\] (.*)', line)
+        line = line.replace("\n", "")
+        match = re.match(r".* \[__output_code\] (.*)", line)
         if match:
             torch_logs_only.append(match.group(1))
 
@@ -252,16 +338,16 @@ def update_triton_kernels_in_prof_chome_trace_with_torch_logs(
     name_to_start_end = {}
     cur_start, cur_end, cur_name = None, None, None
     for line_num, line in enumerate(torch_logs_only):
-        match_start = re.match('\# kernel path: .*', line)
+        match_start = re.match(r"\# kernel path: .*", line)
         if match_start:
             cur_start = line_num
 
         # triton_red_fused_LayerNorm_3 = async_compile.triton('triton_', '''
-        match_name = re.match("([\w_]+) = async_compile.*", line)
+        match_name = re.match(r"([\w_]+) = async_compile.*", line)
         if match_name:
             cur_name = match_name.group(1)
 
-        match_end = re.match("''', device_str='cuda'\)", line)
+        match_end = re.match(r"''', device_str='cuda'\)", line)
         if match_end:
             cur_end = line_num
 
@@ -278,14 +364,14 @@ def update_triton_kernels_in_prof_chome_trace_with_torch_logs(
     #   ...
     #   // CPU ops, with names matchable to triton kernels from inductor output code
     #   {
-    #     # "cat": "cpu_op", 
+    #     # "cat": "cpu_op",
     #     # "name": "triton_red_fused_LayerNorm_abs_max_0",
     #     # "args": {"External id": 1030, ...},
     #     # ...
     #   },
     #   // Inductor kernels, with wall time
     #   {
-    #     # "cat": "kernel", 
+    #     # "cat": "kernel",
     #     # "name": "triton_",  // we don't depend on this name, including for context
     #     # "args": {"External id": 1030, ...},
     #     # "ts": 4275686082015.124, // start time
@@ -299,33 +385,123 @@ def update_triton_kernels_in_prof_chome_trace_with_torch_logs(
     # 2. Using 1, add the metadata to triton kernels
 
     # open the perf trace json
-    with open(perf_trace_file, 'r') as f:
+    with open(perf_trace_file, "r") as f:
         perf_trace = json.load(f)
 
     # find mapping of cpu_op to external_id
     external_id_to_cpu_op = dict()
-    for record in perf_trace['traceEvents']:
+    for record in perf_trace["traceEvents"]:
         # print(record)
-        is_cpu_op = record.get('cat') == 'cpu_op'
+        is_cpu_op = record.get("cat") == "cpu_op"
         if is_cpu_op:
-            external_id_to_cpu_op[record['args']['External id']] = record['name']
+            external_id_to_cpu_op[record["args"]["External id"]] = record["name"]
 
     # add the metadata to triton kernels
-    for record in perf_trace['traceEvents']:
-        is_triton_kernel = record.get('cat') == 'kernel' and 'triton' in record.get('name', '')
+    for record in perf_trace["traceEvents"]:
+        is_triton_kernel = record.get("cat") == "kernel" and "triton" in record.get(
+            "name", ""
+        )
         if not is_triton_kernel:
             continue
-        op_name = external_id_to_cpu_op.get(record['args']['External id'])
+        op_name = external_id_to_cpu_op.get(record["args"]["External id"])
         if op_name is None:
             continue
         start, end = name_to_start_end[op_name]
-        triton_code = torch_logs_only[start:end+1]
-        s = ''
+        triton_code = torch_logs_only[start : end + 1]
+        s = ""
         for line in triton_code:
-            s += f'{line}\n'
-        record['args']['triton_code'] = s
+            s += f"{line}\n"
+        record["args"]["triton_code"] = s
 
     # write the modified file
     # out_file = perf_trace_file.replace('.json', '') + '_with_metadata.json'
-    with open(modified_perf_trace_file, 'w') as f:
+    with open(modified_perf_trace_file, "w") as f:
         json.dump(perf_trace, f)
+
+
+def get_gpu_kernel_gemm_time_s(f, *args, **kwargs):
+    # warmup
+    f(*args, **kwargs)
+    n_iter = 5
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        for idx in range(n_iter):
+            f(*args, **kwargs)
+    data = profiler_output_to_filtered_time_by_kernel_name(
+        prof, n_iter, num_leaf_tensors=0
+    )
+    # there is only 1 key, aten::mm or aten::_scaled_mm, with unit nanoseconds
+    assert len(data) == 1, f"unexpected data: {data}"
+    key, value = next(iter(data.items()))
+    assert key in (
+        "aten::mm",
+        "aten::_scaled_mm",
+        "aten::_scaled_mm_v2",
+        "aten::_grouped_mm",
+        "aten::_scaled_grouped_mm",
+    )
+    return value / 1e6 / n_iter
+
+
+def get_gpu_kernel_conv_time_s(f, *args, **kwargs):
+    # warmup
+    f(*args, **kwargs)
+    n_iter = 5
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        for idx in range(n_iter):
+            f(*args, **kwargs)
+    data = profiler_output_to_filtered_time_by_kernel_name(
+        prof, n_iter, num_leaf_tensors=0
+    )
+
+    # Filter to only conv-related kernels and remove aten::fill_
+    expected_conv_kernels = {
+        "aten::conv2d",
+        "aten::conv3d",
+        "aten::convolution",
+        "aten::cudnn_convolution",
+        "aten::slow_conv_dilated2d",
+        "aten::slow_conv_dilated3d",
+        "mslk::f8f8bf16_conv",
+    }
+
+    # Filter out aten::fill_ and other non-conv operations
+    filtered_data = {k: v for k, v in data.items() if k in expected_conv_kernels}
+
+    assert len(filtered_data) >= 1, (
+        f"No expected conv kernels found. This likely means the kernel list is incomplete. Found kernels: {data}"
+    )
+
+    # If there are multiple conv kernels, take the one with the highest time (the actual conv)
+    key, value = max(filtered_data.items(), key=lambda x: x[1])
+
+    return value / 1e6 / n_iter
+
+
+def benchmark_fn_in_sec(f, *args, **kwargs):
+    # Manual warmup
+    for _ in range(4):
+        f(*args, **kwargs)
+    t0 = benchmark.Timer(
+        stmt="f(*args, **kwargs)", globals={"args": args, "kwargs": kwargs, "f": f}
+    )
+    measurement = t0.blocked_autorange()
+    return measurement.mean
+
+
+def do_benchmarks(
+    tops,
+    peak_tops,
+    use_gpu_kernel_time,
+    f,
+    *args,
+    **kwargs,
+):
+    if use_gpu_kernel_time:
+        # just the gemm GPU kernel
+        time_sec = get_gpu_kernel_gemm_time_s(f, *args, **kwargs)
+    else:
+        # e2e time including kernel launch overhead
+        time_sec = benchmark_fn_in_sec(f, *args, **kwargs)
+    tops_sec = float(tops) / time_sec
+    pct_top_peak = tops_sec / peak_tops
+    return time_sec, tops_sec, pct_top_peak

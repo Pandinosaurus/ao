@@ -1,11 +1,10 @@
 """GitHub Label Utilities."""
 
 import json
-
 from functools import lru_cache
-from typing import Any, List, Tuple, TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Any, List, Tuple, Union
 
-from github_utils import gh_fetch_url_and_headers, GitHubComment
+from github_utils import GitHubComment, gh_fetch_url_and_headers
 
 # TODO: this is a temp workaround to avoid circular dependencies,
 #       and should be removed once GitHubPR is refactored out of trymerge script.
@@ -63,9 +62,9 @@ def gh_get_labels(org: str, repo: str) -> List[str]:
     update_labels(labels, info)
 
     last_page = get_last_page_num_from_header(header)
-    assert (
-        last_page > 0
-    ), "Error reading header info to determine total number of pages of labels"
+    assert last_page > 0, (
+        "Error reading header info to determine total number of pages of labels"
+    )
     for page_number in range(2, last_page + 1):  # skip page 1
         _, info = request_for_labels(prefix + f"&page={page_number}")
         update_labels(labels, info)

@@ -1,39 +1,98 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+# Copyright (c) 2025, NVIDIA CORPORATION.
 # All rights reserved.
 
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-import pytest
+import math
 
+import pytest
 import torch
-from torchao.prototype.mx_formats import config
+from torch._functorch.compile_utils import fx_graph_cse
+from torch._inductor.utils import run_and_get_code
+from torch.fx.experimental.proxy_tensor import make_fx
+from torch.testing import FileCheck
+
+import torchao.prototype.mx_formats.mx_tensor as mx_tensor_module
 from torchao.prototype.mx_formats.constants import (
-    DTYPE_FP4,
     DTYPE_FP6_E2M3,
     DTYPE_FP6_E3M2,
     SUPPORTED_ELEM_DTYPES,
 )
-
-from torchao.prototype.mx_formats.custom_cast import pack_uint4
-
+from torchao.prototype.mx_formats.kernels import pack_uint4
 from torchao.prototype.mx_formats.mx_tensor import (
-    E8M0_EXPONENT_NAN_VAL,
     MXTensor,
+    ScaleCalculationMode,
+    _e8m0_scale_to_reciprocal_fp32,
+    _f32_to_e8m0_rceil,
+    _to_mx_rceil,
     to_dtype,
+    to_mx,
 )
-
+from torchao.prototype.mx_formats.utils import from_blocked, to_blocked
+from torchao.quantization.quantize_.common import KernelPreference
 from torchao.quantization.utils import compute_error
-from torchao.utils import TORCH_VERSION_AT_LEAST_2_4
-
-# trying to outsmart flake8
-__has_cuda = torch.cuda.is_available()
-IS_CUDA_GE_89 = __has_cuda and torch.cuda.get_device_capability() >= (8, 9)
+from torchao.testing._mxfp8_test_utils import (
+    assert_mxfp8_semantics,
+    make_f32_to_e8m0_rceil_cases,
+    make_mxfp8_semantic_cases,
+)
+from torchao.utils import (
+    is_sm_at_least_89,
+    is_sm_at_least_90,
+    torch_version_at_least,
+)
 
 torch.manual_seed(2)
 
-if not TORCH_VERSION_AT_LEAST_2_4:
-    pytest.skip("Unsupported PyTorch version", allow_module_level=True)
+
+def test_f32_to_e8m0_rceil():
+    values, expected = make_f32_to_e8m0_rceil_cases(device="cpu")
+    assert torch.equal(_f32_to_e8m0_rceil(values), expected)
+
+
+@pytest.mark.parametrize("use_direct_cast", (False, True))
+def test_e8m0_scale_to_reciprocal_fp32(monkeypatch, use_direct_cast):
+    monkeypatch.setattr(
+        mx_tensor_module, "_TORCH_VERSION_AT_LEAST_2_14", use_direct_cast
+    )
+    scale_e8m0_biased = torch.arange(256, dtype=torch.uint8)
+    actual = _e8m0_scale_to_reciprocal_fp32(scale_e8m0_biased)
+
+    reciprocal_e8m0_biased = (254 - scale_e8m0_biased.to(torch.int32)).to(torch.uint8)
+    expected = reciprocal_e8m0_biased.view(torch.float8_e8m0fnu).to(torch.float32)
+    assert torch.equal(actual.view(torch.int32), expected.view(torch.int32))
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() or torch.xpu.is_available()),
+    reason="CUDA or XPU not available",
+)
+@pytest.mark.parametrize("use_compile", (False, True), ids=("eager", "compiled"))
+def test_e8m0_scale_to_reciprocal_fp32_gpu_fallback(monkeypatch, use_compile):
+    device = torch.accelerator.current_accelerator().type
+    monkeypatch.setattr(mx_tensor_module, "_TORCH_VERSION_AT_LEAST_2_14", False)
+    scale_e8m0_biased = torch.arange(256, dtype=torch.uint8, device=device)
+    convert = (
+        torch.compile(_e8m0_scale_to_reciprocal_fp32, fullgraph=True)
+        if use_compile
+        else _e8m0_scale_to_reciprocal_fp32
+    )
+    actual_bits = convert(scale_e8m0_biased).cpu().view(torch.int32)
+
+    scale_e8m0_biased_cpu = scale_e8m0_biased.cpu()
+    reciprocal_e8m0_biased = (254 - scale_e8m0_biased_cpu.to(torch.int32)).to(
+        torch.uint8
+    )
+    expected_bits = (
+        reciprocal_e8m0_biased.view(torch.float8_e8m0fnu)
+        .to(torch.float32)
+        .view(torch.int32)
+    )
+    assert actual_bits[254] == 0x00400000  # Exact FP32 subnormal 2^-127.
+    assert actual_bits[255] == 0x7F800001  # E8M0 NaN payload.
+    assert torch.equal(actual_bits, expected_bits)
 
 
 @pytest.fixture(autouse=True)
@@ -50,9 +109,11 @@ def run_before_and_after_tests():
     torch._dynamo.reset()
 
 
-def _test_mx(data_hp, elem_dtype, block_size):
-    data_mx = MXTensor.to_mx(data_hp, elem_dtype, block_size)
-    data_mx_dq = data_mx.to_dtype(data_hp.dtype)
+def _test_mx(
+    data_hp, elem_dtype, block_size, scale_calculation_mode=ScaleCalculationMode.FLOOR
+):
+    data_mx = MXTensor.to_mx(data_hp, elem_dtype, block_size, scale_calculation_mode)
+    data_mx_dq = data_mx.dequantize(data_hp.dtype)
 
     def assert_sqnr_gt_threshold(orig, new, threshold):
         sqnr = compute_error(orig, new)
@@ -64,159 +125,646 @@ def _test_mx(data_hp, elem_dtype, block_size):
             assert sqnr >= threshold
 
     if elem_dtype is torch.float8_e4m3fn:
-        assert_sqnr_gt_threshold(data_hp, data_mx_dq, 20.0)
+        assert_sqnr_gt_threshold(data_hp, data_mx_dq, 18.0)
     else:
-        assert_sqnr_gt_threshold(data_hp, data_mx_dq, 14.0)
+        assert_sqnr_gt_threshold(data_hp, data_mx_dq, 13.0)
+
+    # verify that if data.shape is (M, K) then scale.shape is (M, K // block_size)
+    prev_dims, K = data_hp.shape[:-1], data_hp.shape[-1]
+    if elem_dtype is torch.float4_e2m1fn_x2:
+        assert data_mx.qdata.shape == (*prev_dims, K // 2)
+    else:
+        assert data_mx.qdata.shape == (*prev_dims, K)
+    assert data_mx.scale.shape == (*prev_dims, K // block_size)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() or torch.xpu.is_available()),
+    reason="CUDA or XPU not available",
+)
 @pytest.mark.parametrize("elem_dtype", SUPPORTED_ELEM_DTYPES)
 def test_hello_world(elem_dtype):
-    data = torch.randn(4, 4, device="cuda", dtype=torch.bfloat16)
-    block_size = 2
+    device = torch.accelerator.current_accelerator().type
+    data = torch.randn(8, 8, device=device, dtype=torch.bfloat16)
+    block_size = 4
     _test_mx(data, elem_dtype, block_size)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() or torch.xpu.is_available()),
+    reason="CUDA or XPU not available",
+)
+@pytest.mark.parametrize("scale_calculation_mode", [s for s in ScaleCalculationMode])
+@pytest.mark.parametrize("elem_dtype", SUPPORTED_ELEM_DTYPES)
+def test_realistic_numerics(elem_dtype, scale_calculation_mode):
+    device = torch.accelerator.current_accelerator().type
+    data = torch.randn(128, 128, device=device, dtype=torch.bfloat16)
+    block_size = 32
+    _test_mx(data, elem_dtype, block_size, scale_calculation_mode)
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() or torch.xpu.is_available()),
+    reason="CUDA or XPU not available",
+)
 @pytest.mark.parametrize("elem_dtype", SUPPORTED_ELEM_DTYPES)
 def test_all_zeros(elem_dtype):
-    data = torch.zeros(4, 4, device="cuda", dtype=torch.bfloat16)
-    block_size = 2
+    device = torch.accelerator.current_accelerator().type
+    data = torch.zeros(4, 4, device=device, dtype=torch.bfloat16)
+    block_size = 4
     _test_mx(data, elem_dtype, block_size)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() or torch.xpu.is_available()),
+    reason="CUDA or XPU not available",
+)
 @pytest.mark.parametrize("elem_dtype", SUPPORTED_ELEM_DTYPES)
 def test_some_zeros(elem_dtype):
-    data = torch.randn(4, 4, device="cuda", dtype=torch.bfloat16)
+    device = torch.accelerator.current_accelerator().type
+    data = torch.randn(4, 4, device=device, dtype=torch.bfloat16)
     data[0, :] = 0.0
     data[:, 2] = 0.0
-    block_size = 2
+    block_size = 4
     _test_mx(data, elem_dtype, block_size)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() or torch.xpu.is_available()),
+    reason="CUDA or XPU not available",
+)
+@pytest.mark.parametrize("input_dtype", (torch.float32, torch.bfloat16))
+@pytest.mark.parametrize(
+    "scaling_mode", (ScaleCalculationMode.FLOOR, ScaleCalculationMode.RCEIL)
+)
+@pytest.mark.parametrize("use_compile", (False, True), ids=("eager", "compiled"))
+def test_mxfp8_corner_case_bytes(input_dtype, scaling_mode, use_compile):
+    device = torch.accelerator.current_accelerator().type
+    cases = make_mxfp8_semantic_cases(input_dtype, scaling_mode, device=device)
+    quantize = torch.compile(to_mx, fullgraph=True) if use_compile else to_mx
+    scales, qdata = quantize(cases.inputs, torch.float8_e4m3fn, 32, scaling_mode)
+    assert_mxfp8_semantics(qdata, scales, cases)
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() or torch.xpu.is_available()),
+    reason="CUDA or XPU not available",
+)
+def test_to_mx_rceil():
+    # nan
+    # fmt: off
+    data_hp = torch.tensor(
+        [
+        2143289344, 1054459450, 1060527345, 1045656552, 1058239340, 1045057552, 1061158006, 1049626606,
+        1052757568, 1032293288, 1056992320, 1064929425, 1061036255, 1047450552, 1057077424, 1055125012,
+        1036491424, 1063542041, 1057099838, 1058731224, 1050189482, 1049114228, 1058347802, 1060065968,
+        1058846156, 1048878912, 1065109089, 1054494928, 1044803976, 1049117692, 1065222528, 1056965012,
+        ],
+        dtype=torch.uint32,
+    ).view(torch.float32)
+
+    # fmt: on
+    data_mx = MXTensor.to_mx(
+        data_hp, torch.float8_e4m3fn, 32, ScaleCalculationMode.RCEIL
+    )
+    assert torch.isnan(data_mx.scale)
+    # When any element in block is NaN, entire quantized block becomes NaN
+    assert torch.all(torch.isnan(data_mx.qdata))
+    # fp32 denorm
+    # fmt: off
+    data_hp = torch.tensor(
+        [
+        6142315, 5096174, 3345704, 6178415, 5728750, 419002, 1716691, 4335089,
+        5785800, 6234845, 1697524, 33075, 3975816, 3714822, 5411407, 3040844,
+        7400945, 4474166, 7257182, 1273750, 5872176, 4694081, 2096530, 6273621,
+        67028, 7585260, 4532315, 4599275, 6133942, 4542483, 5992199, 6862780,
+        ],
+        dtype=torch.uint32,
+    ).view(torch.float32)
+    # fmt: on
+    ground_truth_scale = torch.tensor([0], dtype=torch.uint8).view(torch.float8_e8m0fnu)
+    # E8M0 byte 0 is 2^-127, so these FP32 subnormals remain representable
+    # after scaling instead of being flushed to zero.
+    # fmt: off
+    ground_truth_fp8 = torch.tensor(
+        [
+        60, 58, 53, 60, 59, 29, 45, 56,
+        59, 60, 45, 4, 55, 54, 58, 52,
+        62, 57, 62, 42, 59, 57, 48, 60,
+        8, 62, 57, 57, 60, 57, 59, 61,
+        ],
+        dtype=torch.uint8,
+    ).view(torch.float8_e4m3fn)
+    # fmt: on
+    data_mx = MXTensor.to_mx(
+        data_hp, torch.float8_e4m3fn, 32, ScaleCalculationMode.RCEIL
+    )
+    torch.testing.assert_close(data_mx.scale, ground_truth_scale)
+    torch.testing.assert_close(data_mx.qdata, ground_truth_fp8)
+    # bf16 denorm
+    # fmt: off
+    data_hp = torch.tensor(
+        [
+        101, 3, 47, 54, 36, 19, 70, 79,
+        35, 95, 28, 120, 84, 94, 20, 92,
+        18, 42, 98, 58, 3, 26, 64, 86,
+        60, 86, 52, 23, 61, 70, 59, 74,
+        ],
+        dtype=torch.uint16,
+    ).view(torch.bfloat16)
+    # fmt: on
+    ground_truth_scale = torch.tensor([0], dtype=torch.uint8).view(torch.float8_e8m0fnu)
+    # fmt: off
+    ground_truth_fp8 = torch.tensor(
+        [
+        61, 20, 52, 54, 49, 42, 57, 58,
+        49, 60, 46, 63, 58, 60, 42, 60,
+        41, 50, 60, 54, 20, 45, 56, 59,
+        55, 59, 53, 44, 55, 57, 55, 57,
+        ],
+        dtype=torch.uint8,
+    ).view(torch.float8_e4m3fn)
+    # fmt: on
+    data_mx = MXTensor.to_mx(
+        data_hp, torch.float8_e4m3fn, 32, ScaleCalculationMode.RCEIL
+    )
+    torch.testing.assert_close(data_mx.scale, ground_truth_scale)
+    torch.testing.assert_close(data_mx.qdata, ground_truth_fp8)
+    # fp32 some denorm
+    # fmt: off
+    data_hp = torch.tensor(
+        [
+        8388608, 1063716449, 1064039365, 1063568877, 1051091338, 1062185569, 1034449408, 1060813641,
+        1054893736, 1034907680, 1036660744, 1023639888, 1058536559, 1050896496, 1049237634, 1064950601,
+        1051852994, 1059794063, 1054011102, 1062023602, 1059467900, 1062276774, 1059155029, 1053287574,
+        1064378711, 1055768540, 1045266076, 1059575077, 1054928758, 1040468200, 1058061961, 1053066436,
+        ],
+        dtype=torch.uint32,
+    ).view(torch.float32)
+    # fmt: on
+    ground_truth_scale = torch.tensor([119], dtype=torch.uint8).view(
+        torch.float8_e8m0fnu
+    )
+    # fmt: off
+    ground_truth_fp8 = torch.tensor(
+        [
+        0, 118, 119, 118, 106, 117, 91, 116,
+        110, 91, 93, 80, 113, 106, 105, 120,
+        107, 115, 109, 117, 114, 117, 114, 108,
+        119, 111, 101, 114, 110, 96, 113, 108,
+        ],
+        dtype=torch.uint8,
+    ).view(torch.float8_e4m3fn)
+    # fmt: on
+    data_mx = MXTensor.to_mx(
+        data_hp, torch.float8_e4m3fn, 32, ScaleCalculationMode.RCEIL
+    )
+    torch.testing.assert_close(data_mx.scale, ground_truth_scale)
+    torch.testing.assert_close(data_mx.qdata, ground_truth_fp8)
+    # bf16 some denorm
+    # fmt: off
+    data_hp = torch.tensor(
+        [
+        128, 16118, 16143, 16074, 16187, 16002, 16193, 16217,
+        15680, 16183, 16092, 16158, 16251, 15876, 15896, 16194,
+        16135, 16214, 16205, 16110, 16122, 15960, 15824, 16106,
+        16220, 16230, 15952, 15896, 16000, 16144, 16232, 16157,
+        ],
+        dtype=torch.uint16,
+    ).view(torch.bfloat16)
+    # fmt: on
+    ground_truth_scale = torch.tensor([119], dtype=torch.uint8).view(
+        torch.float8_e8m0fnu
+    )
+    # fmt: off
+    ground_truth_fp8 = torch.tensor(
+        [
+        0, 111, 113, 109, 116, 104, 116, 118,
+        84, 115, 110, 114, 120, 96, 98, 116,
+        112, 117, 117, 111, 112, 102, 93, 111,
+        118, 118, 101, 98, 104, 113, 118, 114,
+        ],
+        dtype=torch.uint8,
+    ).view(torch.float8_e4m3fn)
+    # fmt: on
+    data_mx = MXTensor.to_mx(
+        data_hp, torch.float8_e4m3fn, 32, ScaleCalculationMode.RCEIL
+    )
+    torch.testing.assert_close(data_mx.scale, ground_truth_scale)
+    torch.testing.assert_close(data_mx.qdata, ground_truth_fp8)
+    # zero
+    data_hp = torch.tensor([0] * 32, dtype=torch.uint32).view(torch.float32)
+    ground_truth_scale = torch.tensor([0], dtype=torch.uint8).view(torch.float8_e8m0fnu)
+    ground_truth_fp8 = torch.tensor([0] * 32, dtype=torch.uint8).view(
+        torch.float8_e4m3fn
+    )
+    data_mx = MXTensor.to_mx(
+        data_hp, torch.float8_e4m3fn, 32, ScaleCalculationMode.RCEIL
+    )
+    torch.testing.assert_close(data_mx.scale, ground_truth_scale)
+    torch.testing.assert_close(data_mx.qdata, ground_truth_fp8)
+    # fp32 normal
+    # fmt: off
+    data_hp = torch.tensor(
+        [
+        1037408064, 1058534842, 1053630662, 1063310394, 994704128, 1057245441, 1060663708, 1058053571,
+        1052395648, 1064831570, 1038427336, 1064777688, 1059248393, 1060959028, 1062878286, 1057799482,
+        1057854101, 1053562724, 1027482352, 1060498324, 1063238522, 1060472055, 1054346794, 1029092912,
+        1056687298, 1059146141, 1037992128, 1064097772, 1056522806, 1059255744, 1064364912, 1060606252,
+        ],
+        dtype=torch.uint32,
+    ).view(torch.float32)
+    # fmt: on
+    ground_truth_scale = torch.tensor([119], dtype=torch.uint8).view(
+        torch.float8_e8m0fnu
+    )
+    # fmt: off
+    ground_truth_fp8 = torch.tensor(
+        [
+        93, 113, 109, 118, 53, 112, 116, 113,
+        108, 120, 94, 119, 114, 116, 118, 113,
+        113, 109, 84, 115, 118, 115, 110, 85,
+        112, 114, 94, 119, 112, 114, 119, 115,
+        ],
+        dtype=torch.uint8,
+    ).view(torch.float8_e4m3fn)
+    # fmt: on
+    data_mx = MXTensor.to_mx(
+        data_hp, torch.float8_e4m3fn, 32, ScaleCalculationMode.RCEIL
+    )
+    torch.testing.assert_close(data_mx.scale, ground_truth_scale)
+    torch.testing.assert_close(data_mx.qdata, ground_truth_fp8)
+    # bf16 normal
+    # fmt: off
+    data_hp = torch.tensor(
+        [
+        15752, 16143, 16182, 15896, 16195, 16186, 16048, 16223,
+        15988, 16231, 16140, 16088, 16032, 16240, 16228, 16133,
+        16210, 16024, 16248, 16187, 16050, 15696, 16060, 15956,
+        16131, 16251, 15896, 16014, 15808, 16024, 16159, 16186,
+        ],
+        dtype=torch.uint16,
+    ).view(torch.bfloat16)
+    # fmt: on
+    ground_truth_scale = torch.tensor([119], dtype=torch.uint8).view(
+        torch.float8_e8m0fnu
+    )
+    # fmt: off
+    ground_truth_fp8 = torch.tensor(
+        [
+        88, 113, 115, 98, 116, 116, 107, 118,
+        103, 118, 113, 110, 106, 119, 118, 112,
+        117, 106, 120, 116, 107, 85, 108, 101,
+        112, 120, 98, 105, 92, 106, 114, 116,
+        ],
+        dtype=torch.uint8,
+    ).view(torch.float8_e4m3fn)
+    # fmt: on
+    data_mx = MXTensor.to_mx(
+        data_hp, torch.float8_e4m3fn, 32, ScaleCalculationMode.RCEIL
+    )
+    torch.testing.assert_close(data_mx.scale, ground_truth_scale)
+    torch.testing.assert_close(data_mx.qdata, ground_truth_fp8)
+
+
+def test_to_mx_rceil_fallback_nan_branch_is_cse_compatible(monkeypatch):
+    monkeypatch.setattr(mx_tensor_module, "_TORCH_VERSION_AT_LEAST_2_14", False)
+
+    def repeated_rceil(data_hp, max_abs):
+        first = _to_mx_rceil(data_hp, max_abs, 448.0)
+        second = _to_mx_rceil(data_hp, max_abs, 448.0)
+        return *first, *second
+
+    data_hp = torch.randn(4, 32)
+    max_abs = data_hp.abs().amax(dim=-1, keepdim=True)
+    gm = make_fx(repeated_rceil)(data_hp, max_abs)
+    gm.graph = fx_graph_cse(gm.graph)
+
+    nan_branches = []
+    for node in gm.graph.nodes:
+        if node.target != torch.ops.aten.where.self:
+            continue
+        condition = node.args[0]
+        if (
+            isinstance(condition, torch.fx.Node)
+            and condition.target == torch.ops.aten.eq.Scalar
+            and condition.args[1] == 255
+        ):
+            nan_branches.append(node.args[1])
+
+    assert len(nan_branches) == 2
+    assert nan_branches[0] is nan_branches[1]
+    assert nan_branches[0].target == torch.ops.aten.scalar_tensor.default
+    assert nan_branches[0].args[0] == 0x7F800001
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() or torch.xpu.is_available()),
+    reason="CUDA or XPU not available",
+)
 @pytest.mark.parametrize("elem_dtype", SUPPORTED_ELEM_DTYPES)
 def test_exponent_nan_in(elem_dtype):
     """
     If high precision block values has a NaN, the exponent block
     value is set to is NaN
     """
+    device = torch.accelerator.current_accelerator().type
     tensor_hp = torch.tensor(
-        [float("nan"), 1, 2, 3, 4, 5], device="cuda", dtype=torch.bfloat16
+        [float("nan"), 1, 2, 3, 4, 5, 6, 7], device=device, dtype=torch.bfloat16
     )
-    block_size = 2
+    block_size = 4
     tensor_mx = MXTensor.to_mx(tensor_hp, elem_dtype, block_size)
-    assert torch.all(tensor_mx._scale_e8m0[0] == E8M0_EXPONENT_NAN_VAL)
-    assert not torch.any(tensor_mx._scale_e8m0[1:] == E8M0_EXPONENT_NAN_VAL)
+    assert torch.all(torch.isnan(tensor_mx.scale[0]))
+    assert not torch.any(torch.isnan(tensor_mx.scale[1:]))
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() or torch.xpu.is_available()),
+    reason="CUDA or XPU not available",
+)
+@pytest.mark.parametrize("elem_dtype", SUPPORTED_ELEM_DTYPES)
+def test_all_nan_blocks(elem_dtype):
+    """
+    Test NaN handling for blocks with all NaN values vs mixed NaN + real values.
+    - Mixed real + NaN: scale = NaN
+    - All NaN: scale = NaN
+    """
+    device = torch.accelerator.current_accelerator().type
+    block_size = 4
+
+    # Test case 1: Mixed NaN + real values
+    mixed_tensor = torch.tensor(
+        [float("nan"), 2.0, float("nan"), 4.0, 1.0, 3.0, 5.0, 2.0],
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    mixed_mx = MXTensor.to_mx(mixed_tensor, elem_dtype, block_size)
+
+    # First block [NaN, 2.0, NaN, 4.0] should have NaN scale
+    assert torch.isnan(mixed_mx.scale[0]), "Mixed NaN+real block should have NaN scale"
+
+    # Second block [1.0, 3.0, 5.0, 2.0] should have real scale
+    assert not torch.isnan(mixed_mx.scale[1]), (
+        "Real-only block should not have NaN scale"
+    )
+
+    # Test case 2: All NaN blocks (should return NaN scale)
+    all_nan_tensor = torch.tensor(
+        [float("nan"), float("nan"), float("nan"), float("nan"), 1.0, 2.0, 3.0, 4.0],
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    all_nan_mx = MXTensor.to_mx(all_nan_tensor, elem_dtype, block_size)
+
+    # First block [NaN, NaN, NaN, NaN] should have NaN scale (matches CUDA/Triton)
+    assert torch.isnan(all_nan_mx.scale[0]), (
+        "All-NaN block should have NaN scale to match CUDA/Triton"
+    )
+    # Second block [1.0, 2.0, 3.0, 4.0] should have real scale
+    assert not torch.isnan(all_nan_mx.scale[1]), (
+        "Real-only block should not have NaN scale"
+    )
+
+    # Test case 3: Completely all NaN tensor
+    completely_nan_tensor = torch.tensor(
+        [
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            float("nan"),
+        ],
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    completely_nan_mx = MXTensor.to_mx(completely_nan_tensor, elem_dtype, block_size)
+
+    # Both blocks should have NaN scales
+    assert torch.all(torch.isnan(completely_nan_mx.scale)), (
+        "All-NaN tensor should have all NaN scales"
+    )
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() or torch.xpu.is_available()),
+    reason="CUDA or XPU not available",
+)
 @pytest.mark.parametrize("elem_dtype", SUPPORTED_ELEM_DTYPES)
 def test_exponent_nan_out(elem_dtype):
     """
     If block exponent value is NaN, the MX tensor block value is NaN
     """
-    scale_e8m0_bits = torch.tensor(
-        [E8M0_EXPONENT_NAN_VAL, 23, 42], dtype=torch.uint8, device="cuda"
+    device = torch.accelerator.current_accelerator().type
+    scale_e8m0 = torch.tensor(
+        [float("nan"), 1.0], dtype=torch.float8_e8m0fnu, device=device
     )
+
+    block_size = 4
+
     if elem_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
         data_bits = torch.tensor(
-            [0, 1, 2, 3, 4, 5], dtype=elem_dtype, device="cuda"
+            [0, 1, 2, 3, 4, 5, 6, 7], dtype=elem_dtype, device=device
         )  # noqa: E501
     elif elem_dtype in (DTYPE_FP6_E2M3, DTYPE_FP6_E3M2):
         data_bits = torch.tensor(
-            [0, 1, 2, 3, 4, 5], dtype=torch.uint8, device="cuda"
+            [0, 1, 2, 3, 4, 5, 6, 7], dtype=torch.uint8, device=device
         )  # noqa: E501
-    elif elem_dtype == DTYPE_FP4:
+    elif elem_dtype == torch.float4_e2m1fn_x2:
         data_bits = torch.tensor(
-            [0, 1, 2, 3, 4, 5], dtype=torch.uint8, device="cuda"
+            [0, 1, 2, 3, 4, 5, 6, 7], dtype=torch.uint8, device=device
         )  # noqa: E501
         data_bits = pack_uint4(data_bits)
     else:
         raise AssertionError("unsupported")
-    block_size = 2
+    block_size = 4
     tensor_mx = MXTensor(
-        scale_e8m0_bits, data_bits, elem_dtype, block_size, torch.float
+        data_bits,
+        scale_e8m0,
+        elem_dtype,
+        block_size,
+        torch.float,
+        KernelPreference.EMULATED,
+        None,
+        False,
     )
-    tensor_hp = tensor_mx.to_dtype(torch.float)
-    assert torch.all(torch.isnan(tensor_hp[0:1]))
-    assert not torch.any(torch.isnan(tensor_hp[2:]))
+    tensor_hp = tensor_mx.dequantize(torch.float)
+    assert torch.all(torch.isnan(tensor_hp.flatten()[0:4]))
+    assert not torch.any(torch.isnan(tensor_hp.flatten()[4:]))
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() or torch.xpu.is_available()),
+    reason="CUDA or XPU not available",
+)
 @pytest.mark.parametrize("elem_dtype", SUPPORTED_ELEM_DTYPES)
 def test_ranks(elem_dtype):
     """
     The reshaping logic works for various ranks
     """
-    B = 2
-    shapes = ((B * 4,), (B * 4, 2), (B * 4, 2, 2), (B * 4, 2, 2, 2))
+    device = torch.accelerator.current_accelerator().type
+    B = 4
+    shapes = ((B * 4,), (B * 4, 4), (B * 4, 4, 4), (B * 4, 4, 4, 4))
     for s in shapes:
-        tensor_hp = torch.randn(*s, device="cuda", dtype=torch.bfloat16)
+        tensor_hp = torch.randn(*s, device=device, dtype=torch.bfloat16)
         _test_mx(tensor_hp, elem_dtype, B)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() or torch.xpu.is_available()),
+    reason="CUDA or XPU not available",
+)
 @pytest.mark.parametrize("elem_dtype", SUPPORTED_ELEM_DTYPES)
-def test_block_sizes(elem_dtype):
+@pytest.mark.parametrize("B", [1, 4, 32])
+def test_block_sizes(elem_dtype, B):
     """
     Smoke test for various block sizes
     """
-    for B in (1, 2, 32):
-        if B == 1 and elem_dtype == DTYPE_FP4:
-            pytest.skip("unsupported configuration")
-        tensor_hp = torch.randn(B, device="cuda", dtype=torch.bfloat16)
-        _test_mx(tensor_hp, elem_dtype, B)
+    device = torch.accelerator.current_accelerator().type
+    if B == 1 and elem_dtype == torch.float4_e2m1fn_x2:
+        pytest.skip("unsupported configuration")
+    elif B % 4 != 0 and elem_dtype in [DTYPE_FP6_E2M3, DTYPE_FP6_E3M2]:
+        pytest.skip("unsupported configuration")
+    tensor_hp = torch.randn(B, device=device, dtype=torch.bfloat16)
+    _test_mx(tensor_hp, elem_dtype, B)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() or torch.xpu.is_available()),
+    reason="CUDA or XPU not available",
+)
+def test_from_qdata_and_scales_round_trip():
+    device = torch.accelerator.current_accelerator().type
+    tensor_hp = torch.randn(128, 128, device=device, dtype=torch.bfloat16)
+    tensor_mx = MXTensor.to_mx(
+        tensor_hp,
+        torch.float8_e4m3fn,
+        32,
+        ScaleCalculationMode.RCEIL,
+    )
+    rebuilt = MXTensor.from_qdata_and_scales(
+        tensor_mx.qdata,
+        tensor_mx.scale,
+        orig_dtype=tensor_hp.dtype,
+        block_size=32,
+    )
+    torch.testing.assert_close(
+        rebuilt.dequantize(torch.float32),
+        tensor_mx.dequantize(torch.float32),
+    )
+    assert rebuilt.elem_dtype == tensor_mx.elem_dtype
+    assert rebuilt.block_size == tensor_mx.block_size
+    assert rebuilt.orig_dtype == tensor_mx.orig_dtype
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() or torch.xpu.is_available()),
+    reason="CUDA or XPU not available",
+)
+def test_from_qdata_and_scales_requires_float8_e8m0_scale_dtype():
+    device = torch.accelerator.current_accelerator().type
+    tensor_hp = torch.randn(128, 128, device=device, dtype=torch.bfloat16)
+    tensor_mx = MXTensor.to_mx(
+        tensor_hp,
+        torch.float8_e4m3fn,
+        32,
+        ScaleCalculationMode.RCEIL,
+    )
+    with pytest.raises(AssertionError, match="scale.dtype"):
+        MXTensor.from_qdata_and_scales(
+            tensor_mx.qdata,
+            tensor_mx.scale.view(torch.uint8),
+            orig_dtype=tensor_hp.dtype,
+            block_size=32,
+        )
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() or torch.xpu.is_available()),
+    reason="CUDA or XPU not available",
+)
+def test_from_qdata_and_scales_rejects_packed_uint8_qdata():
+    device = torch.accelerator.current_accelerator().type
+    tensor_hp = torch.randn(128, 128, device=device, dtype=torch.bfloat16)
+    tensor_mx = MXTensor.to_mx(
+        tensor_hp,
+        torch.float8_e4m3fn,
+        32,
+        ScaleCalculationMode.RCEIL,
+    )
+    with pytest.raises(AssertionError, match="typed MX qdata"):
+        MXTensor.from_qdata_and_scales(
+            torch.zeros_like(tensor_mx.qdata, dtype=torch.uint8),
+            tensor_mx.scale,
+            orig_dtype=tensor_hp.dtype,
+            block_size=32,
+        )
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() or torch.xpu.is_available()),
+    reason="CUDA or XPU not available",
+)
 @pytest.mark.parametrize("elem_dtype", SUPPORTED_ELEM_DTYPES)
-@pytest.mark.parametrize("fp4_triton", [False, True])
-def test_transpose(elem_dtype, fp4_triton):
+def test_transpose(elem_dtype):
     """
     Verify that transposing an MX tensor works
     """
-    if elem_dtype != DTYPE_FP4 and fp4_triton:
-        pytest.skip("unsupported configuration")
-
-    tensor_hp = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
+    device = torch.accelerator.current_accelerator().type
+    M, K = 128, 256
     block_size = 32
-    tensor_mx = MXTensor.to_mx(tensor_hp, elem_dtype, block_size)
-    config.use_fp4_custom_triton_dequant_kernel = fp4_triton
-    tensor_mx_dq_t = tensor_mx.to_dtype(tensor_hp.dtype).t()
-    config.use_fp4_custom_triton_dequant_kernel = False
+    tensor_hp = torch.randn(M, K, device=device, dtype=torch.bfloat16)
+    tensor_mx = MXTensor.to_mx(
+        tensor_hp,
+        elem_dtype,
+        block_size,
+    )
+    tensor_mx_dq_t = tensor_mx.dequantize(tensor_hp.dtype).t()
 
     tensor_mx_t = tensor_mx.t()
-    config.use_fp4_custom_triton_dequant_kernel = fp4_triton
-    tensor_mx_t_dq = tensor_mx_t.to_dtype(tensor_hp.dtype)
-    config.use_fp4_custom_triton_dequant_kernel = False
+    tensor_mx_t_dq = tensor_mx_t.dequantize(tensor_hp.dtype)
 
     assert tensor_mx_dq_t.shape == tensor_mx_t_dq.shape
     torch.testing.assert_close(tensor_mx_dq_t, tensor_mx_t_dq, atol=0, rtol=0)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-@pytest.mark.parametrize("elem_dtype", SUPPORTED_ELEM_DTYPES)
-def test_cast_autograd(elem_dtype):
-    x = torch.arange(8, device="cuda").bfloat16().requires_grad_()
-    grad = torch.arange(8, device="cuda").bfloat16() * 0.5
-    block_size = 8
-    x_mx = MXTensor.to_mx(x, elem_dtype, block_size)
-    x_dq = x_mx.to_dtype(torch.bfloat16)
-    x_dq.backward(gradient=grad)
-    torch.testing.assert_close(grad, x.grad, atol=0, rtol=0)
-
-
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() or torch.xpu.is_available()),
+    reason="CUDA or XPU not available",
+)
 @pytest.mark.parametrize("elem_dtype", SUPPORTED_ELEM_DTYPES)
 def test_view(elem_dtype):
-    x = torch.randn(1, 2, 4)
-    block_size = 2
+    device = torch.accelerator.current_accelerator().type
+    x = torch.randn(1, 2, 4, device=device)
+    block_size = 4
     x_mx = MXTensor.to_mx(x, elem_dtype, block_size)
     x_mx_2 = x_mx.view(2, 4)  # noqa: F841
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() or torch.xpu.is_available()),
+    reason="CUDA or XPU not available",
+)
+def test_clone():
+    device = torch.accelerator.current_accelerator().type
+    data = torch.randn(8, 8, device=device, dtype=torch.bfloat16)
+    block_size = 4
+    data_mx = MXTensor.to_mx(data, torch.float8_e4m3fn, block_size)
+    data_mx_c = data_mx.clone()
+    torch.testing.assert_close(
+        data_mx.dequantize(torch.bfloat16),
+        data_mx_c.dequantize(torch.bfloat16),
+        atol=0,
+        rtol=0,
+    )
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() or torch.xpu.is_available()),
+    reason="CUDA or XPU not available",
+)
 @pytest.mark.parametrize("elem_dtype", SUPPORTED_ELEM_DTYPES)
 @pytest.mark.parametrize("hp_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("all_zeros", [False, True])
@@ -224,43 +772,334 @@ def test_to_mx_from_mx_compile_numerics(elem_dtype, hp_dtype, all_zeros):
     """
     Verifies that compile does not change numerics of MX casts
     """
+    device = torch.accelerator.current_accelerator().type
     if elem_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-        if not IS_CUDA_GE_89:
+        if torch.cuda.is_available() and not is_sm_at_least_89():
             # separate ifs because flake8 is outsmarting me
             pytest.skip("CUDA capability >= 8.9 required for float8 in triton")
 
     shape = 4, 8
     if not all_zeros:
-        x = torch.randn(*shape, dtype=hp_dtype, device="cuda")
+        x = torch.randn(*shape, dtype=hp_dtype, device=device)
     else:
-        x = torch.zeros(*shape, dtype=hp_dtype, device="cuda")
-    block_size = 2
+        x = torch.zeros(*shape, dtype=hp_dtype, device=device)
+    block_size = 4
     to_mx_c = torch.compile(MXTensor.to_mx, fullgraph=True)
 
     x_mx = MXTensor.to_mx(x, elem_dtype, block_size)
     x_mx_c = to_mx_c(x, elem_dtype, block_size)
     torch.testing.assert_close(
-        x_mx._scale_e8m0,
-        x_mx_c._scale_e8m0,
+        x_mx.scale,
+        x_mx_c.scale,
         atol=0,
         rtol=0,
     )
-    torch.testing.assert_close(x_mx._data, x_mx_c._data, atol=0, rtol=0)
+    torch.testing.assert_close(x_mx.qdata, x_mx_c.qdata, atol=0, rtol=0)
 
     to_dtype_c = torch.compile(to_dtype, fullgraph=True)
 
     x_mx_dq = to_dtype(
-        x_mx._data,
-        x_mx._scale_e8m0,
-        x_mx._elem_dtype,
-        x_mx._block_size,
+        x_mx.qdata,
+        x_mx.scale,
+        x_mx.elem_dtype,
+        x_mx.block_size,
         hp_dtype,  # noqa: E501
     )
     x_mx_c_dq = to_dtype_c(
-        x_mx_c._data,
-        x_mx_c._scale_e8m0,
-        x_mx_c._elem_dtype,
-        x_mx_c._block_size,
+        x_mx_c.qdata,
+        x_mx_c.scale,
+        x_mx_c.elem_dtype,
+        x_mx_c.block_size,
         hp_dtype,
     )
     torch.testing.assert_close(x_mx_dq, x_mx_c_dq, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() or torch.xpu.is_available()),
+    reason="CUDA or XPU not available",
+)
+@pytest.mark.skipif(
+    torch.cuda.is_available() and not is_sm_at_least_89(),
+    reason="float8 in triton requires CUDA capability 8.9 or greater",
+)
+def test_to_mx_inductor_single_kernel():
+    """
+    Verify that inductor can fuse the cast of a high precision tensor to mx
+    into a single kernel
+    """
+    device = torch.accelerator.current_accelerator().type
+    # TODO(future PR): add fp4 and fp6 here
+    # TODO(#1773): add swizzled scale format here
+    x = torch.randn(2048, 2048, dtype=torch.bfloat16, device=device)
+    block_size = 32
+    to_mx_c = torch.compile(MXTensor.to_mx, fullgraph=True)
+    out, code = run_and_get_code(to_mx_c, x, torch.float8_e4m3fn, block_size)
+    FileCheck().check("def call(").check_count(".run(", 1, exactly=True).run(code[0])
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() or torch.xpu.is_available()),
+    reason="CUDA or XPU not available",
+)
+@pytest.mark.skipif(
+    torch.cuda.is_available() and not is_sm_at_least_90(),
+    reason="Need sm90+",
+)
+def test_index_select():
+    """
+    test that `x_0 = x[0]` works when `x` is a 3D `MXTensor`. This is
+    useful when stitching checkpoints of `num_experts` 2D parameters into
+    a single 3D parameter when converting between model definitions that
+    use 2D and 3D parameters for their expert weights.
+    """
+
+    device = torch.accelerator.current_accelerator().type
+    E, K, N = 128, 256, 512
+    x = torch.randn(E, N, K, device=device, dtype=torch.bfloat16)
+    x_mx = MXTensor.to_mx(x, torch.float8_e4m3fn, 32)
+
+    x_mx_1 = x_mx[1]
+    torch.testing.assert_close(
+        x_mx.dequantize(x.dtype)[1], x_mx_1.dequantize(x.dtype), atol=0, rtol=0
+    )
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() or torch.xpu.is_available()),
+    reason="CUDA or XPU not available",
+)
+@pytest.mark.skipif(
+    torch.cuda.is_available() and not is_sm_at_least_89(),
+    reason="float8 in triton requires CUDA capability 8.9 or greater",
+)
+@pytest.mark.skipif(
+    not torch_version_at_least("2.13.0.dev0"),
+    reason="eager float8_e4m3fn casts saturate in PyTorch 2.13+",
+)
+@pytest.mark.parametrize("input_dtype", (torch.float32, torch.bfloat16))
+def test_cast_to_float8_e4m3fn_saturation_behavior(input_dtype):
+    device = torch.accelerator.current_accelerator().type
+    max_val = torch.finfo(torch.float8_e4m3fn).max
+
+    # create example data inside the representable range
+    data_in_range = torch.tensor(
+        [
+            max_val,
+            -1 * max_val,
+        ],
+        dtype=input_dtype,
+        device=device,
+    )
+
+    # create example data outside the representable range
+    data_out_of_range = torch.tensor(
+        [
+            max_val * 2,
+            -1 * (max_val * 2),
+        ],
+        dtype=input_dtype,
+        device=device,
+    )
+
+    # PyTorch core saturates finite-overflow e4m3fn casts as of
+    # https://github.com/pytorch/pytorch/pull/178817.
+    data_in_range_f8 = data_in_range.to(torch.float8_e4m3fn)
+    data_out_of_range_f8 = data_out_of_range.to(torch.float8_e4m3fn)
+    assert not torch.any(torch.isnan(data_in_range_f8))
+    assert not torch.any(torch.isnan(data_out_of_range_f8))
+    torch.testing.assert_close(data_in_range_f8, data_out_of_range_f8, atol=0, rtol=0)
+
+    # verify that in triton, casting to float8 is saturated
+    # for simplicity, use torch.compile to generate triton code
+    def to_f8(x):
+        x = x.to(torch.float8_e4m3fn)
+        return x
+
+    to_f8_c = torch.compile(to_f8)
+    data_in_range_f8_c = to_f8_c(data_in_range)
+    data_out_of_range_f8_c = to_f8_c(data_out_of_range)
+    assert not torch.any(torch.isnan(data_in_range_f8_c))
+    assert not torch.any(torch.isnan(data_out_of_range_f8_c))
+    torch.testing.assert_close(
+        data_in_range_f8_c, data_out_of_range_f8_c, atol=0, rtol=0
+    )
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (128, 4),
+        (256, 8),
+        (100, 3),
+        (4, 4),
+        (50, 10),
+        (384, 12),
+    ],
+)
+@pytest.mark.parametrize(
+    "use_triton_kernel", [False, True] if torch.cuda.is_available() else [False]
+)
+def test_to_blocked_from_blocked_roundtrip(shape, use_triton_kernel: bool):
+    rows, cols = shape
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    original = torch.randint(0, 255, (rows, cols), device=device, dtype=torch.uint8)
+
+    blocked = to_blocked(original, use_triton_kernel=use_triton_kernel)
+    reconstructed = from_blocked(blocked, rows, cols)
+
+    torch.testing.assert_close(
+        original,
+        reconstructed,
+        atol=0.0,
+        rtol=0.0,
+        msg=f"Roundtrip failed for shape {shape} with use_triton_kernel={use_triton_kernel}",
+    )
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() or torch.xpu.is_available()),
+    reason="CUDA or XPU not available",
+)
+@pytest.mark.parametrize("transpose", [False, True])
+@pytest.mark.parametrize(
+    "shape",
+    (
+        (128, 64),
+        (1, 128, 64),
+    ),
+)
+def test_scale_shape_matches_qdata(transpose, shape):
+    device = torch.accelerator.current_accelerator().type
+    if len(shape) == 3 and transpose:
+        pytest.skip("transpose not yet implemented for 3D MXTensor")
+
+    block_size = 32
+
+    x_hp = torch.randn(*shape, device=device)
+    x = MXTensor.to_mx(
+        x_hp,
+        torch.float8_e4m3fn,
+        block_size,
+        ScaleCalculationMode.FLOOR,
+    )
+
+    if len(shape) == 2:
+        m_dim, k_dim = 0, 1
+        if transpose:
+            x_hp = x_hp.t()
+            x = x.t()
+            m_dim, k_dim = 1, 0
+    else:
+        assert len(shape) == 3, "unsupported"
+        m_dim, k_dim = 1, 2
+        if transpose:
+            x_hp = x_hp.transpose(-2, -1)
+            x = x.transpose(-2, -1)
+            m_dim, k_dim = 2, 1
+
+    orig_m = x_hp.shape[m_dim]
+    expected_padded_m = orig_m
+    actual_padded_m = x.scale.shape[m_dim]
+    assert expected_padded_m == actual_padded_m, (
+        f"incompatible padded shape for dim {m_dim}: {expected_padded_m=}, {actual_padded_m=}, {x.shape}, {x.scale.shape}"
+    )
+
+    orig_k = x_hp.shape[k_dim]
+    expected_padded_k = orig_k // block_size
+    actual_padded_k = x.scale.shape[k_dim]
+
+    assert expected_padded_k == actual_padded_k, (
+        f"incompatible padded shape for dim {k_dim}: {expected_padded_k}, {actual_padded_k=}, {x.shape}, {x.scale.shape}"
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("elem_dtype", (torch.float8_e4m3fn, torch.float4_e2m1fn_x2))
+@pytest.mark.parametrize("transpose", [False, True])
+@pytest.mark.parametrize(
+    "shape",
+    (
+        (128, 64),
+        (1, 128, 64),
+    ),
+)
+def test_swizzle(elem_dtype, transpose, shape):
+    if len(shape) == 3 and transpose:
+        pytest.skip("transpose not yet implemented for 3D MXTensor")
+
+    block_size = 32
+
+    x_hp = torch.randn(*shape, device="cuda")
+    x = MXTensor.to_mx(
+        x_hp,
+        elem_dtype,
+        block_size,
+        ScaleCalculationMode.FLOOR,
+    )
+
+    xs = MXTensor.to_mx(
+        x_hp,
+        elem_dtype,
+        block_size,
+        ScaleCalculationMode.FLOOR,
+        is_swizzled_scales=True,
+    )
+
+    if transpose:
+        x = x.t()
+        xs = xs.t()
+
+    torch.testing.assert_close(x.qdata, xs.qdata, atol=0, rtol=0)
+
+    if transpose:
+        leading_dims, M, K = x.shape[:-2], x.shape[-1], x.shape[-2]
+        xs_scale_unblocked = from_blocked(
+            xs.scale.t(), math.prod(leading_dims) * M, K // block_size
+        )
+        xs_scale_unblocked = xs_scale_unblocked.view(*leading_dims, M, K // block_size)
+        xs_scale_unblocked = xs_scale_unblocked.t()
+    else:
+        leading_dims, M, K = x.shape[:-2], x.shape[-2], x.shape[-1]
+        xs_scale_unblocked = from_blocked(
+            xs.scale, math.prod(leading_dims) * M, K // block_size
+        )
+        xs_scale_unblocked = xs_scale_unblocked.view(*leading_dims, M, K // block_size)
+
+    torch.testing.assert_close(
+        x.scale,
+        xs_scale_unblocked,
+        atol=0,
+        rtol=0,
+    )
+
+    x_dq = x.dequantize(x.dtype)
+    xs_dq = xs.dequantize(xs.dtype)
+    torch.testing.assert_close(x_dq, xs_dq, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() or torch.xpu.is_available()),
+    reason="CUDA or XPU not available",
+)
+@pytest.mark.parametrize("elem_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_mx_pin_memory(elem_dtype):
+    device = torch.accelerator.current_accelerator().type
+    x_hp = torch.randn(128, 256, device=device, dtype=torch.bfloat16)
+    x_mx = MXTensor.to_mx(x_hp, elem_dtype, block_size=32)
+    x_cpu = x_mx.cpu()
+
+    assert not x_cpu.is_pinned()
+
+    x_pinned = x_cpu.pin_memory()
+
+    assert x_pinned.is_pinned()
+    assert not x_cpu.is_pinned()
+
+    assert x_pinned.qdata.is_pinned()
+    assert x_pinned.scale.is_pinned()
+
+    assert torch.equal(
+        x_cpu.dequantize(torch.float32), x_pinned.dequantize(torch.float32)
+    )
